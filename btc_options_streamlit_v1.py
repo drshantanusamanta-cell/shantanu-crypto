@@ -23,7 +23,7 @@ SELF-TEST (no network, no streamlit UI):
     python btc_options_streamlit_v1.py --selftest
 """
 
-import os, sys, json, time, tempfile
+import os, sys, json, time, tempfile, threading
 from datetime import datetime, date, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -322,6 +322,373 @@ def fetch_perpetual(symbol="BTC"):
         "funding_8h": safe_num(res.get("funding_8h", 0)),
         "current_funding": safe_num(res.get("current_funding", 0)),
     }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MULTI-EXCHANGE FREE OPTIONS APIs  (v2 addition)
+#   • OKX  public REST    — BTC/ETH options chain, no key, no rate-limit issues
+#   • Bybit public v5     — BTC/ETH options chain, no key
+#   • Binance public      — spot + futures funding (no real options API, used for
+#                            cross-exchange spot triangulation and basis)
+#   • CoinGecko public    — aggregate spot price (cross-venue reference)
+#   • CryptoCompare public — historical OHLC for DVOL-style IV proxy if needed
+# All endpoints are FREE, public, no API key required.
+# ═════════════════════════════════════════════════════════════════════════════
+OKX_BASE    = "https://www.okx.com/api/v5/public"
+BYBIT_BASE  = "https://api.bybit.com/v5/market"
+BINANCE_BASE= "https://api.binance.com"
+COINGECKO   = "https://api.coingecko.com/api/v3"
+
+EXCHANGE_LIST = ["Deribit", "OKX", "Bybit"]   # user-selectable chain source
+
+
+def _okx_get(path: str, params: dict = None, timeout: int = 10) -> dict:
+    """OKX public GET helper. Returns {} on any error."""
+    try:
+        r = _session.get(f"{OKX_BASE}{path}", params=params or {},
+                         headers=HEADERS, timeout=timeout)
+        if not r.text.strip():
+            return {}
+        j = r.json()
+        if j.get("code") != "0":
+            return {}
+        return j
+    except Exception:
+        return {}
+
+
+def _bybit_get(path: str, params: dict = None, timeout: int = 10) -> dict:
+    """Bybit public v5 GET helper. Returns {} on any error."""
+    try:
+        r = _session.get(f"{BYBIT_BASE}{path}", params=params or {},
+                         headers=HEADERS, timeout=timeout)
+        if not r.text.strip():
+            return {}
+        j = r.json()
+        if j.get("retCode") != 0:
+            return {}
+        return j
+    except Exception:
+        return {}
+
+
+def _binance_get(path: str, params: dict = None, timeout: int = 10) -> dict:
+    """Binance public GET helper (spot + futures + funding)."""
+    try:
+        r = _session.get(f"{BINANCE_BASE}{path}", params=params or {},
+                         headers=HEADERS, timeout=timeout)
+        if not r.text.strip():
+            return {}
+        return r.json()
+    except Exception:
+        return {}
+
+
+def _coingecko_get(path: str, params: dict = None, timeout: int = 10) -> dict:
+    """CoinGecko public GET helper (aggregate crypto spot reference)."""
+    try:
+        r = _session.get(f"{COINGECKO}{path}", params=params or {},
+                         headers={"Accept": "application/json"}, timeout=timeout)
+        if not r.text.strip():
+            return {}
+        return r.json()
+    except Exception:
+        return {}
+
+
+# ── OKX options chain ─────────────────────────────────────────────────────────
+def fetch_okx_expiries(symbol="BTC") -> list:
+    """OKX option expiries — returns sorted list of date objects."""
+    inst = symbol + "-USD"
+    j = _okx_get("/public/instruments", {"instType": "OPTION", "uly": inst})
+    exps = set()
+    for row in j.get("data", []) or []:
+        exp_str = row.get("expTime")     # ms epoch
+        if exp_str:
+            try:
+                dt = datetime.fromtimestamp(int(exp_str) / 1000, tz=timezone.utc).date()
+                if dt >= date.today():
+                    exps.add(dt)
+            except Exception:
+                pass
+    return sorted(exps)
+
+
+def fetch_okx_option_chain(symbol="BTC", expiry_date=None):
+    """
+    Returns DataFrame with the same schema as the Deribit fetcher
+    (strike, call_oi, put_oi, call_iv, put_iv, call_delta, call_gamma,
+     call_theta, call_vega, put_delta, put_gamma, put_theta, put_vega,
+     call_ltp, put_ltp, call_oi_chg, put_oi_chg, call_bid, call_ask,
+     put_bid, put_ask) + spot float + expiry date.
+    All numeric fields coerced via safe_num.
+    """
+    uly = symbol + "-USD"
+    j   = _okx_get("/public/instruments", {"instType": "OPTION", "uly": uly})
+    rows = []
+    spot = 0.0
+    # OKX spot via index tickers endpoint
+    sp_j = _okx_get("/market/index-tickers", {"quoteCcyy": "USD"})
+    for it in sp_j.get("data", []) or []:
+        if it.get("instId") == f"{uly}-INDEX":
+            spot = safe_num(it.get("idxPx"))
+            break
+    if not spot:
+        # Fallback: derive from BTC-USDT spot
+        sp_j2 = _okx_get("/market/ticker", {"instId": f"{symbol}-USDT"})
+        spot = safe_num((sp_j2.get("data", [{}])[0] or {}).get("last"))
+
+    instruments = j.get("data", []) or []
+    if not instruments:
+        return pd.DataFrame(), spot, expiry_date
+
+    # Filter to chosen expiry if given
+    if expiry_date is None:
+        # nearest expiry
+        def _exp(inst):
+            try:
+                return datetime.fromtimestamp(int(inst["expTime"]) / 1000, tz=timezone.utc).date()
+            except Exception:
+                return date.today() + timedelta(days=999)
+        instruments = sorted(instruments, key=_exp)
+        if instruments:
+            expiry_date = _exp(instruments[0])
+
+    # Filter instruments by expiry
+    filt = []
+    for inst in instruments:
+        try:
+            d = datetime.fromtimestamp(int(inst["expTime"]) / 1000, tz=timezone.utc).date()
+        except Exception:
+            continue
+        if d == expiry_date:
+            filt.append(inst)
+    instruments = filt
+
+    # OKX public ticker batch — gives OI + last + bid/ask + mark IV
+    # Use /public/market-data with instId family — but easier: per-ticker
+    # We'll batch-call tickers; OKX has a 10-per-call limit via /market/tickers
+    inst_ids = [i["instId"] for i in instruments if i.get("instId")]
+    # Build a map instId → instrument metadata
+    meta = {i["instId"]: i for i in instruments if i.get("instId")}
+
+    # /market/tickers supports OPTION instType with uly
+    tk_j = _okx_get("/market/tickers", {"instType": "OPTION", "uly": uly})
+    tickers = {t["instId"]: t for t in (tk_j.get("data", []) or []) if t.get("instId")}
+
+    by_strike = {}
+    for iid, meta_i in meta.items():
+        # OKX OPTION instId: BTC-USD-241227-95000-C  (date yymmdd, strike, C/P)
+        parts = iid.split("-")
+        if len(parts) < 5:
+            continue
+        try:
+            strike = safe_num(parts[-2])
+            cp     = parts[-1].upper()
+        except Exception:
+            continue
+        if strike <= 0:
+            continue
+        t = tickers.get(iid, {})
+        d = by_strike.setdefault(strike, {})
+        oi  = safe_num(t.get("oi"))
+        oic = safe_num(t.get("oiC"))    # OI change (24h)
+        iv  = safe_num(t.get("markIV")) / 100.0 if t.get("markIV") else 0.0
+        ltp = safe_num(t.get("last"))
+        bid = safe_num(t.get("bidPx"))
+        ask = safe_num(t.get("askPx"))
+        # OKX exposes greeks via /public/opt-summary (one call per instrument — expensive)
+        # For v2 we leave greeks = 0; compute_metrics will fall back to BS solver.
+        greeks = {"delta": 0, "gamma": 0, "theta": 0, "vega": 0}
+        if cp == "C":
+            d.update({
+                "call_oi": oi, "call_oi_chg": oic, "call_iv": iv,
+                "call_delta": greeks["delta"], "call_gamma": greeks["gamma"],
+                "call_theta": greeks["theta"], "call_vega": greeks["vega"],
+                "call_ltp": ltp, "call_bid": bid, "call_ask": ask,
+            })
+        else:
+            d.update({
+                "put_oi": oi, "put_oi_chg": oic, "put_iv": iv,
+                "put_delta": greeks["delta"], "put_gamma": greeks["gamma"],
+                "put_theta": greeks["theta"], "put_vega": greeks["vega"],
+                "put_ltp": ltp, "put_bid": bid, "put_ask": ask,
+            })
+
+    for strike, d in by_strike.items():
+        d.setdefault("call_oi", 0); d.setdefault("put_oi", 0)
+        d.setdefault("call_oi_chg", 0); d.setdefault("put_oi_chg", 0)
+        d.setdefault("call_iv", 0); d.setdefault("put_iv", 0)
+        d.setdefault("call_ltp", 0); d.setdefault("put_ltp", 0)
+        d.setdefault("call_delta", 0); d.setdefault("put_delta", 0)
+        d.setdefault("call_gamma", 0); d.setdefault("put_gamma", 0)
+        d.setdefault("call_theta", 0); d.setdefault("put_theta", 0)
+        d.setdefault("call_vega", 0); d.setdefault("put_vega", 0)
+        d.setdefault("call_bid", 0); d.setdefault("call_ask", 0)
+        d.setdefault("put_bid", 0); d.setdefault("put_ask", 0)
+        d["strike"] = strike
+        rows.append(d)
+
+    df = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
+    return df, round(spot, 2), expiry_date
+
+
+# ── Bybit options chain (v5) ──────────────────────────────────────────────────
+def fetch_bybit_expiries(symbol="BTC") -> list:
+    """Bybit v5 option expiries — returns sorted list of date objects."""
+    j = _bybit_get("/tickers", {"category": "option", "baseCoin": symbol})
+    exps = set()
+    for row in j.get("result", {}).get("list", []) or []:
+        sym = row.get("symbol", "")   # e.g. BTC-27DEC24-95000-C
+        parts = sym.split("-")
+        if len(parts) < 4:
+            continue
+        try:
+            dt = datetime.strptime(parts[1], "%d%b%y").date()
+            if dt >= date.today():
+                exps.add(dt)
+        except Exception:
+            pass
+    return sorted(exps)
+
+
+def fetch_bybit_option_chain(symbol="BTC", expiry_date=None):
+    """
+    Returns DataFrame with the same schema as the Deribit fetcher.
+    Bybit's /market/tickers endpoint for options returns OI, mark price, IV,
+    bid/ask — but NO greeks. We compute greeks via BS solver downstream.
+    """
+    j = _bybit_get("/tickers", {"category": "option", "baseCoin": symbol})
+    rows = j.get("result", {}).get("list", []) or []
+    if not rows:
+        return pd.DataFrame(), 0.0, expiry_date
+
+    # Spot via Bybit index price
+    sp_j = _bybit_get("/tickers", {"category": "linear", "symbol": f"{symbol}USDT"})
+    spot = safe_num((sp_j.get("result", {}).get("list", [{}])[0] or {}).get("lastPrice"))
+
+    # Filter by expiry
+    parsed = []
+    for row in rows:
+        sym = row.get("symbol", "")
+        parts = sym.split("-")
+        if len(parts) < 4:
+            continue
+        try:
+            dt = datetime.strptime(parts[1], "%d%b%y").date()
+        except Exception:
+            continue
+        if expiry_date and dt != expiry_date:
+            continue
+        try:
+            strike = safe_num(parts[2])
+        except Exception:
+            continue
+        cp = parts[3].upper()
+        parsed.append((dt, strike, cp, row))
+
+    if not parsed:
+        return pd.DataFrame(), spot, expiry_date
+
+    if expiry_date is None:
+        # nearest expiry
+        parsed.sort(key=lambda x: x[0])
+        expiry_date = parsed[0][0]
+        parsed = [p for p in parsed if p[0] == expiry_date]
+
+    by_strike = {}
+    for dt, strike, cp, row in parsed:
+        d = by_strike.setdefault(strike, {"strike": strike,
+                                          "call_oi": 0, "put_oi": 0,
+                                          "call_oi_chg": 0, "put_oi_chg": 0,
+                                          "call_iv": 0, "put_iv": 0,
+                                          "call_ltp": 0, "put_ltp": 0,
+                                          "call_delta": 0, "put_delta": 0,
+                                          "call_gamma": 0, "put_gamma": 0,
+                                          "call_theta": 0, "put_theta": 0,
+                                          "call_vega": 0, "put_vega": 0,
+                                          "call_bid": 0, "call_ask": 0,
+                                          "put_bid": 0, "put_ask": 0})
+        oi  = safe_num(row.get("openInterest"))
+        iv  = safe_num(row.get("markIv")) / 100.0 if row.get("markIv") else 0.0
+        ltp = safe_num(row.get("markPrice"))
+        bid = safe_num(row.get("bid1Price"))
+        ask = safe_num(row.get("ask1Price"))
+        if cp == "C":
+            d.update({"call_oi": oi, "call_iv": iv, "call_ltp": ltp,
+                      "call_bid": bid, "call_ask": ask})
+        else:
+            d.update({"put_oi": oi, "put_iv": iv, "put_ltp": ltp,
+                      "put_bid": bid, "put_ask": ask})
+
+    df = pd.DataFrame(list(by_strike.values())).sort_values("strike").reset_index(drop=True)
+    return df, round(spot, 2), expiry_date
+
+
+# ── Binance spot + funding rate (cross-exchange reference) ────────────────────
+def fetch_binance_spot(symbol="BTC") -> dict:
+    """Binance spot + perpetual funding (for cross-venue triangulation)."""
+    out = {"spot": 0.0, "perp_mark": 0.0, "funding_rate": 0.0, "next_funding_ms": 0}
+    sp = _binance_get("/api/v3/ticker/price", {"symbol": f"{symbol}USDT"})
+    out["spot"] = safe_num(sp.get("price"))
+    # Perpetual futures
+    fp = _binance_get("/fapi/v1/premiumIndex", {"symbol": f"{symbol}USDT"})
+    out["perp_mark"]      = safe_num(fp.get("markPrice"))
+    out["funding_rate"]   = safe_num(fp.get("lastFundingRate"))
+    out["next_funding_ms"]= safe_num(fp.get("nextFundingTime"))
+    return out
+
+
+# ── CoinGecko aggregate spot ──────────────────────────────────────────────────
+def fetch_coingecko_spot(coin="bitcoin") -> float:
+    """CoinGecko aggregate spot — cross-venue reference price."""
+    j = _coingecko_get(f"/simple/price", {"ids": coin, "vs_currencies": "usd"})
+    return safe_num(j.get(coin, {}).get("usd"))
+
+
+# ── Unified chain fetcher (multi-exchange) ────────────────────────────────────
+def fetch_chain_multi(symbol="BTC", expiry_arg=None, exchange="Deribit"):
+    """
+    Routes the chain fetch to the chosen exchange.
+    Returns (df, spot, expiry_date).
+    Falls back to Deribit if the chosen exchange fails or returns empty.
+    """
+    if exchange == "OKX":
+        try:
+            df, spot, exp = fetch_okx_option_chain(symbol, expiry_arg)
+            if not df.empty and spot > 0:
+                return df, spot, exp
+        except Exception:
+            pass
+    elif exchange == "Bybit":
+        try:
+            df, spot, exp = fetch_bybit_option_chain(symbol, expiry_arg)
+            if not df.empty and spot > 0:
+                return df, spot, exp
+        except Exception:
+            pass
+    # Default / fallback: Deribit
+    return fetch_option_chain(symbol, expiry_arg)
+
+
+def fetch_cross_venue_spot(symbol="BTC") -> dict:
+    """
+    Aggregate spot across Deribit, Binance, CoinGecko — useful for
+    arbitrage detection and cross-venue divergence signals.
+    """
+    venues = {}
+    try: venues["deribit"]   = fetch_spot(symbol)
+    except Exception: venues["deribit"] = 0
+    try: venues["binance"]   = fetch_binance_spot(symbol)["spot"]
+    except Exception: venues["binance"] = 0
+    try: venues["coingecko"] = fetch_coingecko_spot("bitcoin" if symbol == "BTC" else "ethereum")
+    except Exception: venues["coingecko"] = 0
+    venues["mean"] = round(np.mean([v for v in venues.values() if v > 0]), 2) if any(venues.values()) else 0
+    venues["max_spread_pct"] = 0.0
+    pts = [v for v in [venues["deribit"], venues["binance"], venues["coingecko"]] if v > 0]
+    if len(pts) >= 2 and venues["mean"] > 0:
+        venues["max_spread_pct"] = round((max(pts) - min(pts)) / venues["mean"] * 100, 4)
+    return venues
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -854,6 +1221,734 @@ def compute_dw_composite_bias(bkt: dict, expiry_str=None) -> dict:
             "narrative": narrative, "delta_active": _delta_ok}
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# NEW v2 ANALYSIS LAYERS  (ported & adapted from nifty_streamlit_v5_fixed.py)
+#   • classify_iv_smile_scenario  — 9-state smile classifier (Sc01..Sc09)
+#   • get_s34_band / get_smile_bucket / classify_quadrant
+#   • detect_divergence_type + _compute_divergence_proximity
+#   • generate_combined_decision  — the Combined Bias Decision engine
+#   • _compute_grf  — Greek Risk Framework (0–10 conviction scorer)
+#   • compute_leading_signals  — divergence / velocity / exhaustion / inter-expiry
+#   • compute_shantanu_view    — ND/NDM Decision Matrix + Enhanced NDM
+# All operate on the existing `m` metrics dict + `df_band` and need NO new
+# API calls. Crypto-adapted (no India VIX, uses DVOL + perp basis instead).
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── Smile scenario metadata ──────────────────────────────────────────────────
+_SMILE_SCENARIOS = {
+    1:  {"name": "Put-Skew (Hedge Build)",       "bucket": "BEARISH_FEAR",      "color": "#DC2626"},
+    2:  {"name": "Crash Fear (Wing Bid)",        "bucket": "BEARISH_FEAR",      "color": "#7F1D1D"},
+    3:  {"name": "Put-Skew + IV Expansion",      "bucket": "BEARISH_FEAR",      "color": "#B91C1C"},
+    4:  {"name": "Smile Flattening (Relief)",    "bucket": "BULLISH_NEUTRAL",   "color": "#10B981"},
+    5:  {"name": "Call-Skew (Risk-On)",          "bucket": "BULLISH_NEUTRAL",   "color": "#059669"},
+    6:  {"name": "Call Wing Lift",               "bucket": "BULLISH_NEUTRAL",   "color": "#34D399"},
+    7:  {"name": "Symmetric Smile (Stable)",     "bucket": "BULLISH_NEUTRAL",   "color": "#6B7280"},
+    8:  {"name": "Coiled Spring (IV Compression)","bucket": "NEUTRAL_COMPRESSED","color": "#9333EA"},
+    9:  {"name": "Term-Structure Inversion",     "bucket": "NEUTRAL_COMPRESSED","color": "#B45309"},
+}
+
+_QUADRANT_META = {
+    "Q1": {"name": "Bullish · Confirmed", "short": "Q1 BULL",
+           "color": "#059669", "badge_bg": "#ECFDF5",
+           "description": "S3/4 bullish + smile risk-on.",
+           "action": "Look for long entries on dips; favour call spreads and put selling."},
+    "Q2": {"name": "Bearish · Confirmed", "short": "Q2 BEAR",
+           "color": "#DC2626", "badge_bg": "#FEE2E2",
+           "description": "S3/4 bullish + smile fear.",
+           "action": "Bull-bear divergence — reduce longs, hedge with put spreads."},
+    "Q3": {"name": "Reversal Watch (Bear→Bull)", "short": "Q3 REV",
+           "color": "#D97706", "badge_bg": "#FFFBEB",
+           "description": "S3/4 bearish + smile relief.",
+           "action": "Bear trap risk — cover shorts, watch for upside confirmation."},
+    "Q4": {"name": "Bearish · Confirmed", "short": "Q4 BEAR",
+           "color": "#7F1D1D", "badge_bg": "#FECACA",
+           "description": "S3/4 bearish + smile fear.",
+           "action": "Look for short entries on rallies; favour put spreads and call selling."},
+    "CN": {"name": "Neutral · Compressed", "short": "CN NEUTRAL",
+           "color": "#6B7280", "badge_bg": "#F3F4F6",
+           "description": "S3/4 in dead band; vol squeeze likely.",
+           "action": "Favour long-vol structures (straddles); avoid directional bets."},
+}
+
+
+def classify_iv_smile_scenario(df_band, m, spot, iv_smile_history=None):
+    """
+    Classify the current IV-smile shape into one of 9 scenarios (Sc01..Sc09).
+    Adapted from nifty v5 — uses crypto-appropriate thresholds.
+    Reads put/call IV at OTM wings relative to ATM.
+    Returns dict: scenario_id, name, bucket, color, iv_rank, skew_now.
+    """
+    if df_band is None or df_band.empty:
+        return {"scenario_id": 0, "name": "Insufficient data", "bucket": "NEUTRAL",
+                "color": "#6B7280", "iv_rank": m.get("iv_rank", 50), "skew_now": 0.0}
+
+    atm        = safe_num(m.get("atm", spot))
+    step       = get_strike_step(m.get("_symbol", "BTC"))
+    df         = df_band.copy()
+    for c in ("strike", "call_iv", "put_iv"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+    atm_rows   = df[df["strike"].between(atm - step, atm + step)]
+    otm_puts   = df[df["strike"] < atm - 3 * step]
+    otm_calls  = df[df["strike"] > atm + 3 * step]
+
+    atm_iv     = float(atm_rows["call_iv"].mean() or atm_rows["put_iv"].mean() or 0) if not atm_rows.empty else 0
+    put_wing   = float(otm_puts["put_iv"].mean())  if not otm_puts.empty  else 0
+    call_wing  = float(otm_calls["call_iv"].mean()) if not otm_calls.empty else 0
+
+    if atm_iv <= 0:
+        return {"scenario_id": 0, "name": "ATM IV missing", "bucket": "NEUTRAL",
+                "color": "#6B7280", "iv_rank": m.get("iv_rank", 50), "skew_now": 0.0}
+
+    put_skew   = (put_wing  - atm_iv) if put_wing  > 0 else 0
+    call_skew  = (call_wing - atm_iv) if call_wing > 0 else 0
+    skew_now   = round(put_skew - call_skew, 2)
+    iv_rank    = safe_num(m.get("iv_rank", 50))
+
+    # Decision tree
+    if put_skew > 12 and iv_rank >= 65:
+        sid = 2  # Crash Fear
+    elif put_skew > 8 and iv_rank >= 50:
+        sid = 3  # Put-Skew + IV Expansion
+    elif put_skew > 6:
+        sid = 1  # Put-Skew (Hedge Build)
+    elif call_skew > 6 and iv_rank <= 45:
+        sid = 5  # Call-Skew (Risk-On)
+    elif call_skew > 4:
+        sid = 6  # Call Wing Lift
+    elif abs(put_skew) < 3 and abs(call_skew) < 3 and iv_rank >= 40:
+        sid = 7  # Symmetric Smile (Stable)
+    elif abs(put_skew) < 3 and abs(call_skew) < 3 and iv_rank <= 20:
+        sid = 8  # Coiled Spring
+    elif put_skew < -2 and call_skew < -2:
+        sid = 4  # Smile Flattening (Relief)
+    else:
+        sid = 9  # Term-Structure Inversion / catchall
+
+    meta = _SMILE_SCENARIOS.get(sid, _SMILE_SCENARIOS[9])
+    return {"scenario_id": sid, "name": meta["name"], "bucket": meta["bucket"],
+            "color": meta["color"], "iv_rank": iv_rank, "skew_now": skew_now,
+            "put_skew": put_skew, "call_skew": call_skew}
+
+
+def get_s34_band(score: float) -> str:
+    """Map S3/4 bias score to a band A..E."""
+    if score >= 51:   return "A"
+    if score >= 16:   return "B"
+    if score > -16:   return "C"
+    if score > -51:   return "D"
+    return "E"
+
+
+def get_smile_bucket(scenario_id: int) -> str:
+    return _SMILE_SCENARIOS.get(scenario_id, {}).get("bucket", "NEUTRAL")
+
+
+def classify_quadrant(s34_score: float, scenario_id: int) -> dict:
+    """4-Quadrant classification (Q1..Q4 + CN)."""
+    band         = get_s34_band(s34_score)
+    smile_bucket = get_smile_bucket(scenario_id)
+    if band == "C":
+        q = "CN"
+    elif band in ("A", "B"):
+        q = "Q1" if smile_bucket != "BEARISH_FEAR" else "Q2"
+    else:
+        q = "Q3" if smile_bucket == "BULLISH_NEUTRAL" else "Q4"
+    meta = _QUADRANT_META[q]
+    return {
+        "quadrant": q, "name": meta["name"], "short": meta["short"],
+        "color": meta["color"], "badge_bg": meta["badge_bg"],
+        "description": meta["description"], "action": meta["action"],
+        "smile_bucket": smile_bucket, "s34_band": band,
+    }
+
+
+# ── Divergence metadata ──────────────────────────────────────────────────────
+_DIVERGENCE_META = {
+    1: {"type": "Type 1 — Capitulation Bottom", "color": "#059669", "badge_bg": "#ECFDF5",
+        "warning": "POTENTIAL CAPITULATION BOTTOM — do not initiate new shorts at these levels",
+        "detail": "S3/4 at extreme bear AND IV smile shows Crash Fear. Hedgers already in — they are sellers of the rally."},
+    2: {"type": "Type 2 — Structural Ceiling", "color": "#D97706", "badge_bg": "#FFFBEB",
+        "warning": "STRUCTURAL CEILING — smart money hedging longs; reduce long exposure",
+        "detail": "S3/4 strong bull BUT smile is building put-skew. Smart money reducing risk at the top."},
+    3: {"type": "Type 3 — Squeeze Warning", "color": "#9333EA", "badge_bg": "#FAF5FF",
+        "warning": "SQUEEZE WARNING — breakout imminent; direction unknown; favour long vol",
+        "detail": "S3/4 neutral AND smile compressed (Coiled Spring). Directional biases unreliable; favour straddles."},
+    4: {"type": "Type 4 — Bear Trap", "color": "#2563EB", "badge_bg": "#EFF6FF",
+        "warning": "BEAR TRAP RISK — call buying despite bearish OI structure; cover shorts",
+        "detail": "S3/4 negative BUT smile shows call buying / relief. Sentiment recovering — squeeze risk."},
+    5: {"type": "Type 5 — Pre-Move Setup", "color": "#B45309", "badge_bg": "#FEF3C7",
+        "warning": "PRE-MOVE SETUP — smart money positioning; wait for OI velocity confirmation",
+        "detail": "PCR extreme AND S3/4 moderately biased AND smile aligned. Watch OI velocity + gamma flip."},
+}
+
+
+def detect_divergence_type(s34_score, scenario_id, pcr=1.0, div_proximity=0.0):
+    """Returns divergence dict or None if no divergence is active."""
+    band         = get_s34_band(s34_score)
+    smile_bucket = get_smile_bucket(scenario_id)
+    # Hard triggers
+    if band == "E" and scenario_id == 2:
+        d = _DIVERGENCE_META[1].copy()
+        d["strength"] = "HARD"; return d
+    if band == "A" and scenario_id in (1, 3):
+        d = _DIVERGENCE_META[2].copy()
+        d["strength"] = "HARD"; return d
+    if band == "C" and scenario_id == 8:
+        d = _DIVERGENCE_META[3].copy()
+        d["strength"] = "HARD"; return d
+    if band in ("D", "E") and scenario_id in (4, 5, 6):
+        d = _DIVERGENCE_META[4].copy()
+        d["strength"] = "HARD"; return d
+    if (pcr < 0.70 or pcr > 1.55) and abs(s34_score) > 15 and scenario_id not in (7, 8):
+        d = _DIVERGENCE_META[5].copy()
+        d["strength"] = "HARD"; return d
+    # Soft / approaching
+    if div_proximity >= 60:
+        # find the closest hard trigger by re-evaluating proximity components
+        if s34_score < -40:   d = _DIVERGENCE_META[1].copy()
+        elif s34_score > 40:  d = _DIVERGENCE_META[2].copy()
+        elif abs(s34_score) < 15: d = _DIVERGENCE_META[3].copy()
+        elif s34_score < -16: d = _DIVERGENCE_META[4].copy()
+        else:                 d = _DIVERGENCE_META[5].copy()
+        d["strength"] = "SOFT"; return d
+    return None
+
+
+def _compute_divergence_proximity(s34_score, scenario_id, pcr, iv_rank):
+    """0–100. >= 60 triggers an APPROACHING DIVERGENCE alert."""
+    scores = []
+    t1_s34 = max(0, min(100, (abs(s34_score) - 40) / 11 * 100)) if s34_score < -40 else 0
+    t1_smile = max(0, min(100, (iv_rank - 50) / 15 * 100)) if iv_rank > 50 else 0
+    if scenario_id in (1, 2, 3): t1_smile = max(t1_smile, 60)
+    scores.append((t1_s34 + t1_smile) / 2)
+    t2_s34 = max(0, min(100, (s34_score - 40) / 11 * 100)) if s34_score > 40 else 0
+    t2_smile = 70 if scenario_id in (1, 3) else (30 if scenario_id in (2, 9) else 0)
+    scores.append((t2_s34 + t2_smile) / 2)
+    t3_neutral = max(0, min(100, (15 - abs(s34_score)) / 15 * 100)) if abs(s34_score) < 15 else 0
+    t3_compress = max(0, min(100, (25 - iv_rank) / 5 * 100)) if iv_rank < 25 else 0
+    scores.append((t3_neutral + t3_compress) / 2)
+    t5_pcr = 0
+    if pcr < 0.70:    t5_pcr = max(0, min(100, (0.70 - pcr) / 0.20 * 100))
+    elif pcr > 1.55:  t5_pcr = max(0, min(100, (pcr - 1.55) / 0.25 * 100))
+    t5_s34 = max(0, min(100, (abs(s34_score) - 15) / 15 * 100)) if abs(s34_score) > 15 else 0
+    scores.append((t5_pcr + t5_s34) / 2)
+    return round(max(scores), 1) if scores else 0.0
+
+
+def generate_combined_decision(m, spot, bias, smile, history=None,
+                                vwap_or=None, ts_signal=None, vix_signal=None,
+                                enhanced_price_bias=None):
+    """
+    Combine S3/4 options bias + IV smile + PCR + price confirmation layers
+    into a single Quadrant + Action + Confidence panel.
+    Adapted from nifty v5 generate_combined_decision — for crypto we use
+    DVOL/perp-basis as the VIX surrogate.
+    """
+    s34_score      = safe_num(bias.get("bias_score", 0))
+    s34_dir        = bias.get("direction", "NEUTRAL")
+    s34_breakdown  = bias.get("factors", [])
+    scenario_id    = smile.get("scenario_id", 0)
+    pcr            = safe_num(m.get("pcr", 1.0))
+    iv_rank        = safe_num(m.get("iv_rank", 50))
+
+    quad = classify_quadrant(s34_score, scenario_id)
+    div_prox = _compute_divergence_proximity(s34_score, scenario_id, pcr, iv_rank)
+    div      = detect_divergence_type(s34_score, scenario_id, pcr, div_prox)
+
+    # Confidence: how far score is from neutral, plus smile alignment
+    base_conf = min(100, abs(s34_score) * 1.1)
+    smile_aligned = (s34_score > 15 and smile["bucket"] == "BULLISH_NEUTRAL") or \
+                     (s34_score < -15 and smile["bucket"] == "BEARISH_FEAR")
+    if smile_aligned: base_conf = min(100, base_conf + 15)
+    elif smile["bucket"] in ("BEARISH_FEAR", "BULLISH_NEUTRAL"):
+        base_conf = max(0, base_conf - 10)
+    if div and div.get("strength") == "HARD":
+        base_conf = max(0, base_conf - 20)
+
+    if   base_conf >= 75: conf_label, conf_color = "HIGH",      "#059669"
+    elif base_conf >= 50: conf_label, conf_color = "MODERATE",  "#D97706"
+    else:                 conf_label, conf_color = "LOW",       "#DC2626"
+
+    # Explanation lines
+    lines = [
+        f"S3/4 bias: <strong>{s34_dir}</strong> at {s34_score:+.0f}/100 ({quad['s34_band']}-band)",
+        f"IV Smile: <strong>{smile.get('name','—')}</strong> ({smile.get('bucket','—')})",
+        f"PCR {pcr:.2f} · IV rank {iv_rank:.0f} · Max-pain pull ${safe_num(m.get('max_pain',spot)) - spot:+,.0f}",
+    ]
+    if div:
+        lines.append(f"<strong style='color:{div['color']}'>{div['type']}</strong> — {div['warning']}")
+
+    # Enhanced price layer override (if supplied)
+    overridden = False
+    enhanced_score = 0
+    if enhanced_price_bias and enhanced_price_bias.get("enhanced_score", 0) != 0:
+        enhanced_score = enhanced_price_bias["enhanced_score"]
+        # If enhanced layer strongly disagrees with S3/4, override quadrant
+        if (s34_score > 15 and enhanced_score < -25) or (s34_score < -15 and enhanced_score > 25):
+            overridden = True
+            quad = classify_quadrant(enhanced_score, scenario_id)
+
+    return {
+        "quadrant":         quad["quadrant"],
+        "quadrant_short":   quad["short"],
+        "quadrant_color":   quad["color"],
+        "badge_bg":         quad["badge_bg"],
+        "action":           quad["action"],
+        "confidence_label": conf_label,
+        "confidence_color": conf_color,
+        "confidence_pct":   base_conf,
+        "explanation_lines": lines,
+        "divergence":       div,
+        "s34_score":        s34_score,
+        "s34_direction":    s34_dir,
+        "smile_scenario":   smile.get("name", "—"),
+        "pcr":              pcr,
+        "quadrant_overridden": overridden,
+        "enhanced_score":   enhanced_score,
+    }
+
+
+def _compute_grf(m_dict, spot_px):
+    """
+    Greek Risk Framework scorer — adapted from nifty v5 _compute_grf.
+    Returns 0–10 conviction score split as Gamma(0-3) + Delta(0-3) + Momentum(0-4).
+    For crypto, we use the existing m['gex'], m['net_delta'], m['momentum'] etc.
+    """
+    nd      = safe_num(m_dict.get("net_delta", 0))
+    mom     = safe_num(m_dict.get("momentum", 0))
+    gex     = safe_num(m_dict.get("gex", 0))
+    d_res   = safe_num(m_dict.get("dist_to_resistance", 0))
+    d_sup   = safe_num(m_dict.get("dist_to_support", 0))
+    mp_val  = safe_num(m_dict.get("max_pain", spot_px))
+    pcr     = safe_num(m_dict.get("pcr", 1.0))
+    iv_r    = safe_num(m_dict.get("iv_rank", 50))
+    gflip   = m_dict.get("gamma_flip")
+    sup_w   = safe_num(m_dict.get("support", 0))
+    res_w   = safe_num(m_dict.get("resistance", 0))
+    fac     = []
+
+    _oi_scale = max(1.0, safe_num(m_dict.get("call_oi_total", 0)) + safe_num(m_dict.get("put_oi_total", 0)))
+    nd_sig    = abs(nd)  > max(100, _oi_scale * 0.001)
+    mom_sig   = abs(mom) > max(50,  _oi_scale * 0.0005)
+
+    # 1. Gamma Score (0-3)
+    g = 0
+    inside_band = (d_res > 0) and (d_sup > 0)
+    if inside_band:
+        min_buf = (min(d_res, d_sup) / spot_px * 100) if spot_px > 0 else 0
+        if   min_buf > 1.0: g += 2; fac.append(f"Walls {min_buf:.1f}% from spot — safe sell range")
+        elif min_buf > 0.5: g += 1; fac.append(f"Moderate wall buffer ({min_buf:.1f}%)")
+        else:                       fac.append(f"Walls very close ({min_buf:.1f}%) — elevated gamma risk")
+        if gex > 0: g += 1
+    else:
+        broke_dir = "above resistance" if d_res <= 0 else "below support"
+        fac.append(f"⚠ Spot {broke_dir} — gamma range breached, avoid selling")
+    g = min(g, 3)
+
+    # 2. Delta Score (0-3)
+    d = 0
+    nd_bull = nd > 0
+    if nd_sig:
+        d += 1
+        fac.append(f"Net delta {'bullish' if nd_bull else 'bearish'} ({nd:+,.0f})")
+    if nd_sig and mp_val > 0 and spot_px > 0:
+        mp_bull = mp_val > spot_px
+        if nd_bull == mp_bull and abs(mp_val - spot_px) > 20:
+            d += 1
+            fac.append(f"Max pain (${int(mp_val)}) confirms {'upside' if mp_bull else 'downside'} pull")
+    if nd_sig and gflip is not None:
+        gf = safe_num(gflip)
+        if gf > 0 and (spot_px > gf) == nd_bull:
+            d += 1
+            fac.append(f"Spot {'above' if spot_px > gf else 'below'} gamma flip (${int(gf)}) — regime aligned")
+    d = min(d, 3)
+
+    # 3. Momentum Score (0-4)
+    ms       = 0
+    mom_bull = mom > 0
+    if not mom_sig:
+        ms = 1
+    elif nd_sig and mom_bull == nd_bull:
+        ms = 3
+        fac.append(f"OI momentum confirms {'bullish' if mom_bull else 'bearish'} flow ({mom:+,.0f})")
+    elif nd_sig and mom_bull != nd_bull:
+        ms = 0
+        fac.append("⚠ Momentum contradicts net delta — divergence, cut size")
+    else:
+        ms = 2
+    if nd_sig:
+        if nd_bull and pcr >= 1.2:
+            ms = min(ms + 1, 4); fac.append(f"PCR {pcr:.2f} confirms bullish support")
+        elif not nd_bull and pcr <= 0.8:
+            ms = min(ms + 1, 4); fac.append(f"PCR {pcr:.2f} confirms bearish pressure")
+    if   iv_r <= 35: ms = min(ms + 1, 4)   # calm IV = ideal sell environment
+    elif iv_r >= 70: ms = max(ms - 1, 0)   # high IV = elevated risk
+    ms = min(ms, 4)
+
+    total = g + d + ms
+
+    # Bias label
+    if   nd > 0 and mom > 0:   bias_s = "BULLISH"
+    elif nd < 0 and mom < 0:   bias_s = "BEARISH"
+    elif nd > 0 and mom < 0:   bias_s = "MIXED — delta bull / momentum fading"
+    elif nd < 0 and mom > 0:   bias_s = "MIXED — delta bear / momentum recovering"
+    elif nd > 0:               bias_s = "BULLISH (flat momentum)"
+    elif nd < 0:               bias_s = "BEARISH (flat momentum)"
+    elif mom > 0:              bias_s = "NEUTRAL — flow tilting bullish"
+    elif mom < 0:              bias_s = "NEUTRAL — flow tilting bearish"
+    else:                      bias_s = "NEUTRAL"
+
+    if   total >= 8: conv, cc, sl, rtxt = "HIGH CONVICTION", "#059669", "Full size",  "All Greeks aligned. Deploy full planned size within the gamma range."
+    elif total >= 6: conv, cc, sl, rtxt = "GOOD SETUP",      "#10B981", "Standard",   "Most signals confirm. Trade standard size; monitor the weakest Greek."
+    elif total >= 4: conv, cc, sl, rtxt = "MODERATE",        "#D97706", "Half size",  "Mixed signals. Half size only, or wait 30–60 min for clarity."
+    elif total >= 2: conv, cc, sl, rtxt = "LOW",             "#F59E0B", "Avoid",      "Greeks not aligned. Watch only — do not deploy capital now."
+    else:            conv, cc, sl, rtxt = "NO TRADE",        "#DC2626", "Stay out",   "Conflicting signals. Protect capital and wait for a cleaner setup."
+
+    iv_env = "Low IV — ideal" if iv_r <= 35 else ("High IV — caution" if iv_r >= 70 else "Mid IV — ok")
+    return dict(
+        total=total, g=g, d=d, ms=ms,
+        bias_s=bias_s, conv=conv, cc=cc, sl=sl, rtxt=rtxt,
+        fac=fac[:4],
+        gamma_range=f"${int(sup_w):,}–${int(res_w):,}" if sup_w and res_w else "—",
+        iv_env=iv_env, iv_r=iv_r,
+    )
+
+
+def compute_leading_signals(m, bias, spot, history, smile, expiry_list=None):
+    """
+    Leading Signals / Early Warning panel data — adapted from nifty v5.
+    Computes:
+      • divergence_proximity (0–100)
+      • bias_velocity + acceleration
+      • gamma_flip_proximity
+      • OI momentum exhaustion
+      • inter-expiry OI flow (only if multiple expiries available)
+    """
+    out = {
+        "div_proximity":     0.0,
+        "velocity":          0.0,
+        "acceleration":      0.0,
+        "gamma_flip_proximity": None,
+        "oi_exhaustion":     None,
+        "inter_expiry":      None,
+    }
+
+    s34_score = safe_num(bias.get("bias_score", 0))
+    scen_id   = smile.get("scenario_id", 0)
+    pcr       = safe_num(m.get("pcr", 1.0))
+    iv_rank   = safe_num(m.get("iv_rank", 50))
+
+    out["div_proximity"] = _compute_divergence_proximity(s34_score, scen_id, pcr, iv_rank)
+
+    # Bias velocity from history
+    if history and len(history) >= 3:
+        scores = [safe_num(h.get("bias_score", 0)) for h in history[-5:]]
+        scores.append(s34_score)
+        if len(scores) >= 3:
+            vels = [scores[i] - scores[i-1] for i in range(1, len(scores))]
+            out["velocity"]     = round(vels[-1], 1) if vels else 0.0
+            if len(vels) >= 2:
+                out["acceleration"] = round(vels[-1] - vels[-2], 1)
+
+    # Gamma flip proximity
+    gflip = m.get("gamma_flip")
+    if gflip and gflip > 0 and spot > 0:
+        flip_dist = abs(spot - gflip)
+        wall_w    = safe_num(m.get("wall_width", 500))
+        step      = max(wall_w / 20, 50)
+        thresh    = max(2.0 * step, 100)
+        out["gamma_flip_proximity"] = {
+            "flip_strike":         round(gflip, 0),
+            "distance_pts":        round(flip_dist, 1),
+            "threshold_pts":       round(thresh, 1),
+            "pct_of_threshold":    round(flip_dist / thresh * 100, 1) if thresh > 0 else 0,
+            "side":                "ABOVE" if spot > gflip else "BELOW",
+            "zone":                "FLIP_ZONE" if flip_dist < thresh else "SAFE",
+            "regime_risk":         "HIGH" if flip_dist < step else ("ELEVATED" if flip_dist < thresh else "LOW"),
+        }
+
+    # OI momentum exhaustion (needs 5+ history points)
+    if history and len(history) >= 5:
+        moms = [safe_num(h.get("momentum", 0)) for h in history[-6:]]
+        moms.append(safe_num(m.get("momentum", 0)))
+        if len(moms) >= 5:
+            sign = 1 if moms[-1] > 0 else (-1 if moms[-1] < 0 else 0)
+            if sign != 0:
+                signed = [v * sign for v in moms]
+                if all(v > 0 for v in signed):
+                    mags = [abs(v) for v in moms]
+                    recent  = float(np.mean(mags[-2:]))
+                    earlier = float(np.mean(mags[:3])) if len(mags) >= 3 else recent
+                    ratio   = recent / earlier if earlier > 0.5 else 1.0
+                    out["oi_exhaustion"] = {
+                        "direction":     "BULL" if sign > 0 else "BEAR",
+                        "exhaust_ratio": round(ratio, 2),
+                        "exhausting":    ratio < 0.50,
+                        "label":         ("EXHAUSTING" if ratio < 0.50 else
+                                          "FADING"     if ratio < 0.75 else "STRONG"),
+                        "color":         ("#DC2626" if ratio < 0.50 else
+                                          "#F59E0B" if ratio < 0.75 else "#059669"),
+                    }
+    return out
+
+
+def compute_shantanu_view(df_band, m, spot, symbol="BTC"):
+    """
+    Shantanu's ND/NDM Decision Matrix — adapted from nifty v5.
+    Per-strike Net Delta (ND) and NDM (Net Delta Momentum):
+      ND  = (Call OI × |Call Δ|) − (Put OI × |Put Δ|)
+      NDM = (Call OI Chg × |Call Δ|) − (Put OI Chg × |Put Δ|)
+    Enhanced NDM corrects for buyer/writer stance using EV ratio.
+    Returns dict with ND/NDM totals + Enhanced NDM breakdown.
+    """
+    if df_band is None or df_band.empty:
+        return {"available": False}
+
+    df = df_band.copy()
+    for c in ("strike","call_oi","put_oi","call_oi_chg","put_oi_chg",
+              "call_delta","put_delta","call_ltp","put_ltp","call_iv","put_iv"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+    df["_cd_abs"] = df["call_delta"].abs()
+    df["_pd_abs"] = df["put_delta"].abs()
+    df["_nd"]     = (df["call_oi"]     * df["_cd_abs"]) - (df["put_oi"]     * df["_pd_abs"])
+    df["_ndm"]    = (df["call_oi_chg"] * df["_cd_abs"]) - (df["put_oi_chg"] * df["_pd_abs"])
+
+    atm      = safe_num(m.get("atm", spot))
+    step     = get_strike_step(symbol)
+    calls    = df[df["strike"] > atm + step]
+    puts     = df[df["strike"] < atm - step]
+    atm_band = df[df["strike"].between(atm - step, atm + step)]
+
+    total_nd  = float(df["_nd"].sum())
+    total_ndm = float(df["_ndm"].sum())
+
+    # Enhanced NDM using EV ratio
+    ev_ratio = safe_num(m.get("ev_ratio", 1.0))
+    if ev_ratio > 1:    c_prem_dir, p_prem_dir = 1, -1     # Call buyer / Put writer
+    elif ev_ratio < 1:  c_prem_dir, p_prem_dir = -1, 1     # Put buyer / Call writer
+    else:               c_prem_dir, p_prem_dir = 0, 0
+
+    enhanced_rows = []
+    for _, r in df.iterrows():
+        c_oi_chg = float(r.get("call_oi_chg", 0))
+        p_oi_chg = float(r.get("put_oi_chg",  0))
+        c_delta  = abs(float(r.get("call_delta", 0)))
+        p_delta  = abs(float(r.get("put_delta", 0)))
+        raw_ndm  = (c_oi_chg * c_delta) - (p_oi_chg * p_delta)
+        if c_prem_dir == 0 and p_prem_dir == 0:
+            enh_val = 0
+        else:
+            c_contrib = c_oi_chg * c_delta * c_prem_dir
+            p_contrib = p_oi_chg * p_delta * (-p_prem_dir)
+            enh_val   = c_contrib + p_contrib
+        enhanced_rows.append({
+            "Strike":     int(r["strike"]),
+            "C OI Chg":   int(c_oi_chg),
+            "C Prem Dir": "~ Neutral" if c_prem_dir == 0 else ("↑ Buyer" if c_prem_dir == 1 else "↓ Writer"),
+            "P OI Chg":   int(p_oi_chg),
+            "P Prem Dir": "~ Neutral" if p_prem_dir == 0 else ("↑ Buyer" if p_prem_dir == 1 else "↓ Writer"),
+            "Enhanced NDM": round(enh_val),
+            "Raw NDM":      round(raw_ndm),
+        })
+
+    enh_total = sum(r["Enhanced NDM"] for r in enhanced_rows)
+    raw_total = sum(r["Raw NDM"]      for r in enhanced_rows)
+
+    # Signal classification
+    if enh_total > 0 and raw_total > 0:
+        signal, sc, sbg = ("✅ CONFIRMED BULLISH — Buyer-driven call pressure. MM hedge = buy spot.",
+                           "#059669", "#D1FAE5")
+    elif enh_total < 0 and raw_total < 0:
+        signal, sc, sbg = ("✅ CONFIRMED BEARISH — Buyer-driven put pressure. MM hedge = sell spot.",
+                           "#DC2626", "#FEE2E2")
+    elif enh_total > 0 and raw_total < 0:
+        signal, sc, sbg = ("⚠️ DIVERGENCE — Writer puts reversing raw signal → Lean BULLISH. Verify DVOL + PCR.",
+                           "#D97706", "#FFFBEB")
+    elif enh_total < 0 and raw_total > 0:
+        signal, sc, sbg = ("⚠️ DIVERGENCE — Writer calls reversing raw signal → Lean BEARISH. Verify DVOL + PCR.",
+                           "#D97706", "#FFFBEB")
+    else:
+        signal, sc, sbg = ("➖ NEUTRAL / MIXED — No dominant aggressor side.",
+                           "#6B7280", "#F9FAFB")
+
+    return {
+        "available":       True,
+        "otm_call_nd":     float(calls["_nd"].sum())   if not calls.empty   else 0,
+        "otm_put_nd":      float(puts["_nd"].sum())    if not puts.empty    else 0,
+        "atm_nd":          float(atm_band["_nd"].sum()) if not atm_band.empty else 0,
+        "otm_call_ndm":    float(calls["_ndm"].sum())  if not calls.empty   else 0,
+        "otm_put_ndm":     float(puts["_ndm"].sum())   if not puts.empty    else 0,
+        "atm_ndm":         float(atm_band["_ndm"].sum()) if not atm_band.empty else 0,
+        "total_nd":        total_nd,
+        "total_ndm":       total_ndm,
+        "enh_total":       enh_total,
+        "raw_total":       raw_total,
+        "ev_ratio":        ev_ratio,
+        "signal":          signal,
+        "signal_color":    sc,
+        "signal_bg":       sbg,
+        "enhanced_rows":   enhanced_rows,
+        "df":              df,
+    }
+
+
+def compute_enhanced_price_bias(vwap_or, ts_signal, vix_signal,
+                                 s34_score, spot):
+    """
+    Top-of-dashboard Enhanced Price Bias — adapted from nifty v5.
+    Combines S3/4 options bias with three price-action confirmation layers:
+      • VWAP / Opening Range (crypto: rolling VWAP from intraday candles)
+      • Term Structure (front vs back expiry IV — if available)
+      • VIX surrogate = DVOL (Deribit's 30-day IV index)
+    For v2 crypto: VWAP/OR may be None (no intraday source yet); ts_signal
+    comes from comparing two expiries; vix_signal comes from DVOL.
+    """
+    layers = []
+    s34_col = "#059669" if s34_score > 10 else ("#DC2626" if s34_score < -10 else "#6B7280")
+    layers.append(("S3/4", s34_score, s34_col))
+
+    price_score = 0
+    if vwap_or and vwap_or.get("available"):
+        price_score = safe_num(vwap_or.get("price_score", 0))
+        price_col   = vwap_or.get("price_color", "#6B7280")
+        layers.append(("VWAP/OR", price_score, price_col))
+
+    ts_score = 0
+    if ts_signal and ts_signal.get("available"):
+        ts_score = safe_num(ts_signal.get("ts_score", 0))
+        ts_col   = ts_signal.get("ts_color", "#6B7280")
+        layers.append(("Term Struct", ts_score, ts_col))
+
+    vix_score = 0
+    if vix_signal and vix_signal.get("available"):
+        vix_score = safe_num(vix_signal.get("vix_score", 0))
+        vix_col   = vix_signal.get("vix_color", "#6B7280")
+        layers.append(("VIX", vix_score, vix_col))
+
+    if not layers:
+        return None
+
+    # Weighted average — S3/4 always weighted; new signals weighted by availability
+    weights = {"S3/4": 0.5, "VWAP/OR": 0.20, "Term Struct": 0.15, "VIX": 0.15}
+    num = sum(score * weights.get(name, 0) for name, score, _ in layers)
+    den = sum(weights.get(name, 0) for name, _, _ in layers)
+    enhanced_score = round(num / den, 1) if den > 0 else 0
+
+    # Direction + color
+    if   enhanced_score >  15: edir, ecol = "BULLISH", "#059669"
+    elif enhanced_score < -15: edir, ecol = "BEARISH", "#DC2626"
+    else:                      edir, ecol = "NEUTRAL", "#6B7280"
+
+    # Agreement
+    signs = [1 if s > 5 else (-1 if s < -5 else 0) for _, s, _ in layers]
+    non_zero = [s for s in signs if s != 0]
+    if non_zero:
+        agreement = round(sum(1 for s in non_zero if s == non_zero[0]) / len(non_zero) * 100, 0)
+    else:
+        agreement = 0
+
+    # Confidence
+    conf = min(100, abs(enhanced_score) * 1.1 + (agreement - 50) * 0.4)
+
+    new_sig_avail = sum(1 for n, _, _ in layers if n != "S3/4")
+
+    return {
+        "enhanced_score":   enhanced_score,
+        "direction":        edir,
+        "color":            ecol,
+        "enhanced_conf":    conf,
+        "agreement_pct":    agreement,
+        "s34_score":        s34_score,
+        "price_score":      price_score,
+        "ts_score":         ts_score,
+        "vix_score":        vix_score,
+        "new_signals_available": new_sig_avail,
+        "vwap_or":          vwap_or,
+        "ts_signal":        ts_signal,
+        "vix_signal":       vix_signal,
+    }
+
+
+def fetch_vix_signal(dvol_now, dvol_hist):
+    """
+    Crypto VIX surrogate using Deribit DVOL.
+    Returns dict with vix, change, label, color, score, available.
+    """
+    if not dvol_now or dvol_now <= 0:
+        return {"available": False}
+    # Determine if high/low relative to history
+    if dvol_hist and len(dvol_hist) >= 10:
+        hist_vals = [v for v in dvol_hist[-30:] if v > 0]
+        if hist_vals:
+            mn, mx = min(hist_vals), max(hist_vals)
+            pct = (dvol_now - mn) / (mx - mn) * 100 if mx > mn else 50
+        else:
+            pct = 50
+    else:
+        pct = 50
+
+    # Score: high DVOL = bearish VIX signal (fear), low DVOL = complacent/bullish
+    # Crypto convention: DVOL > 80 → fear; DVOL < 50 → complacency
+    if   dvol_now >= 90:  vlabel, vcolor, vscore = "EXTREME FEAR", "#7F1D1D", -45
+    elif dvol_now >= 75:  vlabel, vcolor, vscore = "HIGH FEAR",    "#DC2626", -25
+    elif dvol_now >= 60:  vlabel, vcolor, vscore = "ELEVATED",     "#D97706", -10
+    elif dvol_now >= 45:  vlabel, vcolor, vscore = "NEUTRAL",      "#6B7280",   0
+    elif dvol_now >= 35:  vlabel, vcolor, vscore = "COMPLACENT",   "#059669",  10
+    else:                 vlabel, vcolor, vscore = "OVER-COMPLACENT","#7F1D1D", 20  # too low = surprise risk
+
+    chg = None
+    if dvol_hist and len(dvol_hist) >= 2:
+        prev = dvol_hist[-2] if dvol_hist[-2] > 0 else 0
+        if prev > 0:
+            chg = dvol_now - prev
+
+    return {
+        "available":   True,
+        "vix":         dvol_now,
+        "vix_change":  chg,
+        "vix_label":   vlabel,
+        "vix_color":   vcolor,
+        "vix_score":   vscore,
+        "vix_pctile":  pct,
+    }
+
+
+def fetch_term_structure_signal(symbol="BTC", front_expiry=None, back_expiry=None):
+    """
+    Compare front-month ATM IV vs back-month ATM IV.
+    Returns dict with ts_score, ts_label, ts_color, available.
+    Contango (front < back) = normal/complacent; Inversion (front > back) = stress.
+    """
+    if not front_expiry or not back_expiry or front_expiry == back_expiry:
+        return {"available": False}
+    try:
+        front_df, front_spot, _ = fetch_option_chain(symbol, front_expiry)
+        back_df,  back_spot,  _ = fetch_option_chain(symbol, back_expiry)
+        if front_df.empty or back_df.empty:
+            return {"available": False}
+        # ATM IV from each
+        f_atm = min(front_df["strike"], key=lambda x: abs(x - front_spot))
+        b_atm = min(back_df["strike"],  key=lambda x: abs(x - back_spot))
+        f_iv  = float(front_df[front_df["strike"] == f_atm][["call_iv","put_iv"]].mean().mean() or 0)
+        b_iv  = float(back_df[back_df["strike"]  == b_atm][["call_iv","put_iv"]].mean().mean() or 0)
+        if f_iv <= 0 or b_iv <= 0:
+            return {"available": False}
+        diff = f_iv - b_iv   # positive = inversion
+        if   diff >  3:  ts_label, ts_color, ts_score = "INVERSION (stress)",    "#DC2626", -30
+        elif diff >  1:  ts_label, ts_color, ts_score = "Mild Inversion",        "#D97706", -10
+        elif diff > -1:  ts_label, ts_color, ts_score = "Flat",                  "#6B7280",   0
+        elif diff > -3:  ts_label, ts_color, ts_score = "Normal Contango",       "#059669",  10
+        else:            ts_label, ts_color, ts_score = "Steep Contango (calm)", "#10B981",  20
+        return {"available": True, "front_iv": f_iv, "back_iv": b_iv, "diff": diff,
+                "ts_label": ts_label, "ts_color": ts_color, "ts_score": ts_score}
+    except Exception:
+        return {"available": False}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HISTORY PERSISTENCE  (atomic JSON write — same pattern as nifty streamlit v5)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -881,7 +1976,181 @@ def _save_history(h):
     _atomic_json_write(HISTORY_FILE, h)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# OWNER SETTINGS PERSISTENCE  (refresh interval, vega band width, Z-score TF/lookback)
+# Adapted from nifty_streamlit_v5_fixed.py — atomic JSON write, TTL cache.
+# For crypto v2 we keep the same shape but the FILE path is project-local.
+# ─────────────────────────────────────────────────────────────────────────────
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "crypto_owner_settings.json")
+_persist_lock   = threading.Lock()
+_owner_settings_cache = {"data": None, "ts": 0.0}
+_OWNER_SETTINGS_TTL = 5.0   # seconds — coalesce multiple calls within 5s
+
+# Owner refresh-interval presets (data refresh, NOT page refresh)
+_REFRESH_OPTIONS = {
+    "30 sec":  30,
+    "1 min":   60,
+    "2 min":   120,
+    "5 min":   300,
+    "15 min":  900,
+    "30 min":  1800,
+}
+
+# Vega-band-width presets — governs all 4 Z-Score charts (raw & OI-wtd Vega
+# Ratio, raw & OI-wtd CE/PE EV Ratio). Number of strikes either side of ATM.
+_VEGA_BAND_OPTIONS = {"±3 strikes (default)": 3,
+                      "±5 strikes":           5,
+                      "±7 strikes":           7,
+                      "±10 strikes":          10}
+
+# Z-Score TF (time-bucket width) — governs all 4 Z-Score charts
+_ZS_TF_OPTIONS = {
+    "5 min":           5,
+    "15 min (default)": 15,
+    "30 min":          30,
+    "60 min":          60,
+}
+
+# Z-Score look-back period — number of TF bars the rolling Z-score spans
+_ZS_LOOKBACK_OPTIONS = {f"{n} bars": n for n in range(5, 11)}
+
+
+def _load_owner_settings():
+    """TTL-cached read of owner_settings.json (5s coalesce window)."""
+    now = time.time()
+    if (_owner_settings_cache["data"] is not None and
+        now - _owner_settings_cache["ts"] < _OWNER_SETTINGS_TTL):
+        return _owner_settings_cache["data"]
+    with _persist_lock:
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                data = json.load(f)
+        except Exception:
+            data = {"refresh_interval": REFRESH_SECS, "vega_band_strikes": 3,
+                    "zscore_tf_minutes": 15, "zscore_lookback_buckets": 6,
+                    "selected_expiry": None}
+    _owner_settings_cache["data"] = data
+    _owner_settings_cache["ts"]   = now
+    return data
+
+
+def _save_owner_settings(settings):
+    with _persist_lock:
+        try:
+            _atomic_json_write(SETTINGS_FILE, settings)
+        except Exception:
+            pass
+    # invalidate TTL cache so the next read picks up the new value
+    _owner_settings_cache["data"] = None
+    _owner_settings_cache["ts"]   = 0.0
+
+
+# ── ATM-band vega + extrinsic-value helpers (used by build_history_entry + Z-Score charts) ──
+def _compute_atm_band_vegas(df_band, atm, step, band_n):
+    """
+    Sum call_vega / put_vega across ATM ± band_n strikes.
+    Returns (raw_call_vega, raw_put_vega, oiw_call_vega, oiw_put_vega).
+    OI-weighted versions multiply each strike's vega by its OI before summing.
+    """
+    out = (0.0, 0.0, 0.0, 0.0)
+    if df_band is None or df_band.empty or step <= 0:
+        return out
+    lo, hi = atm - band_n * step, atm + band_n * step
+    vb = df_band[df_band["strike"].between(lo, hi)].copy()
+    if vb.empty:
+        return out
+    for c in ("call_vega", "put_vega", "call_oi", "put_oi"):
+        if c in vb.columns:
+            vb[c] = pd.to_numeric(vb[c], errors="coerce").fillna(0.0)
+    raw_c = float(vb["call_vega"].sum())
+    raw_p = float(vb["put_vega"].sum())
+    oiw_c = float((vb["call_oi"] * vb["call_vega"]).sum())
+    oiw_p = float((vb["put_oi"]  * vb["put_vega"]).sum())
+    return (raw_c, raw_p, oiw_c, oiw_p)
+
+
+def _extrinsic_value(ltp, intrinsic):
+    """EV = max(0, LTP − intrinsic). Returns 0 if LTP missing."""
+    if ltp is None or ltp <= 0:
+        return 0.0
+    return max(0.0, float(ltp) - max(0.0, float(intrinsic)))
+
+
+def _compute_atm_band_ev_ratios(df_band, spot, atm, step, band_n):
+    """
+    Strike-wise CE/PE extrinsic-value ratio across ATM ± band_n strikes.
+    Returns (raw_avg, oiw_avg).
+      raw_avg = mean over strikes of (call_ev / put_ev)
+      oiw_avg = mean over strikes of (call_ev × call_oi) / (put_ev × put_oi)
+    Skips strikes where put_ev == 0 (NaN-safe).
+    """
+    if df_band is None or df_band.empty or step <= 0:
+        return (1.0, 1.0)
+    lo, hi = atm - band_n * step, atm + band_n * step
+    vb = df_band[df_band["strike"].between(lo, hi)].copy()
+    if vb.empty:
+        return (1.0, 1.0)
+    for c in ("call_ltp", "put_ltp", "call_oi", "put_oi", "strike"):
+        if c in vb.columns:
+            vb[c] = pd.to_numeric(vb[c], errors="coerce").fillna(0.0)
+    # Per-strike extrinsic values
+    vb["call_ev"] = vb.apply(
+        lambda r: _extrinsic_value(r.get("call_ltp", 0), spot - r["strike"]), axis=1)
+    vb["put_ev"]  = vb.apply(
+        lambda r: _extrinsic_value(r.get("put_ltp", 0),  r["strike"] - spot), axis=1)
+    # Raw per-strike ratio
+    raw_ratio = vb["call_ev"] / vb["put_ev"].replace(0, np.nan)
+    raw_avg = float(raw_ratio.mean(skipna=True)) if raw_ratio.notna().any() else 1.0
+    # OI-weighted per-strike ratio
+    oiw_num = vb["call_ev"] * vb["call_oi"]
+    oiw_den = vb["put_ev"]  * vb["put_oi"]
+    oiw_ratio = oiw_num / oiw_den.replace(0, np.nan)
+    oiw_avg = float(oiw_ratio.mean(skipna=True)) if oiw_ratio.notna().any() else 1.0
+    return (raw_avg, oiw_avg)
+
+
+# ── Z-Score engine helpers (used by Section 18) ──────────────────────────────
+def _make_tf_buckets(ts_list, cols, freq_min=15):
+    """Floor tick timestamps into freq_min-minute bars, keep the LAST value per bar.
+    The most recent (in-progress) bar reflects the latest tick and updates every
+    rerun; once a new bar starts, the prior one is frozen for good."""
+    _idx = pd.to_datetime(ts_list, errors="coerce")
+    _df = pd.DataFrame(cols, index=_idx)
+    _df = _df[~_df.index.isna()]
+    if _df.empty:
+        return _df
+    _df["bucket"] = _df.index.floor(f"{freq_min}min")
+    return _df.groupby("bucket", as_index=True).last().sort_index()
+
+
+def _bucket_zscore(series, window_buckets=6):
+    """Z-score on an already-bucketed series using an N-bar rolling window."""
+    _roll = series.rolling(window_buckets, min_periods=2)
+    _mean = _roll.mean()
+    _std  = _roll.std(ddof=0)
+    _z = (series - _mean) / _std.replace(0, np.nan)
+    return _z.fillna(0.0).round(3)
+
+
 def build_history_entry(m, spot, symbol, ts):
+    # ── ATM-band vega + EV ratios — captured at fetch time so the Z-Score
+    # charts can read them straight from history without re-fetching. Band
+    # width is the owner-configurable vega_band_strikes (default ±3). ──────
+    try:
+        _vb_n = int(_load_owner_settings().get("vega_band_strikes", 3))
+    except Exception:
+        _vb_n = 3
+    _step = get_strike_step(symbol)
+    _atm  = safe_num(m.get("atm", spot))
+    # df_band is popped off m before build_history_entry is called for the
+    # main fetch path, so we re-extract a tight band from df_signal if available.
+    _df_for_vega = m.get("df_signal")
+    if _df_for_vega is None or getattr(_df_for_vega, "empty", True):
+        _df_for_vega = m.get("df_band")
+    _raw_c, _raw_p, _oiw_c, _oiw_p = _compute_atm_band_vegas(_df_for_vega, _atm, _step, _vb_n)
+    _ev_raw, _ev_oiw = _compute_atm_band_ev_ratios(_df_for_vega, spot, _atm, _step, _vb_n)
+
     return {
         "ts": ts, "symbol": symbol, "spot": spot,
         "atm": m.get("atm", 0), "support": m.get("support", 0),
@@ -898,6 +2167,14 @@ def build_history_entry(m, spot, symbol, ts):
         "near_oichg_concentration": m.get("near_oichg_concentration", 0),
         "ev_ratio": m.get("ev_ratio", 1), "net_vega": m.get("net_vega", 0),
         "net_theta": m.get("net_theta", 0),
+        # ── v2 NEW: ATM-band vega + EV-ratio fields for Z-Score charts ──
+        "atm_call_vega_raw":  round(_raw_c, 6),    # raw Σcall_vega (no OI weighting)
+        "atm_put_vega_raw":   round(_raw_p, 6),    # raw Σput_vega
+        "atm_call_vega":      round(_oiw_c, 6),    # OI-weighted Σcall_oi×call_vega
+        "atm_put_vega":       round(_oiw_p, 6),    # OI-weighted Σput_oi×put_vega
+        "ev_ratio_avg_strikewise":     round(_ev_raw, 4),  # strike-wise avg of CE/PE EV ratio
+        "ev_ratio_oiw_avg_strikewise": round(_ev_oiw, 4),  # OI-weighted strike-wise avg
+        "vega_band_strikes": _vb_n,                # band half-width used this tick
     }
 
 
@@ -1172,10 +2449,80 @@ def _selftest():
     i1, i2, i3, i4 = build_intraday_charts(hist, "BTC")
     assert all(isinstance(f, go.Figure) for f in (i1, i2, i3, i4))
 
+    # ── v2 NEW: test the new analysis layers ─────────────────────────────────
+    m["_symbol"] = "BTC"
+    smile   = classify_iv_smile_scenario(m["df_band"], m, spot)
+    assert "scenario_id" in smile and 0 <= smile["scenario_id"] <= 9
+
+    grf     = _compute_grf(m, spot)
+    assert 0 <= grf["total"] <= 10
+    assert grf["conv"] in ("HIGH CONVICTION", "GOOD SETUP", "MODERATE", "LOW", "NO TRADE")
+
+    ls      = compute_leading_signals(m, bias, spot, hist, smile)
+    assert "div_proximity" in ls and 0 <= ls["div_proximity"] <= 100
+
+    sv      = compute_shantanu_view(m["df_band"], m, spot, "BTC")
+    assert sv.get("available") is True
+    assert "enhanced_rows" in sv and len(sv["enhanced_rows"]) > 0
+
+    vix_sig = fetch_vix_signal(72.0, [60, 65, 70, 72])
+    assert vix_sig.get("available") is True
+    assert vix_sig["vix_label"] in ("EXTREME FEAR", "HIGH FEAR", "ELEVATED",
+                                     "NEUTRAL", "COMPLACENT", "OVER-COMPLACENT")
+
+    cd      = generate_combined_decision(m, spot, bias, smile, hist)
+    assert "quadrant" in cd and cd["quadrant"] in ("Q1", "Q2", "Q3", "Q4", "CN")
+    assert "action" in cd and "explanation_lines" in cd
+
+    eb      = compute_enhanced_price_bias(None, {"available": False}, vix_sig,
+                                          bias["bias_score"], spot)
+    assert eb is None or -100 <= eb["enhanced_score"] <= 100
+
+    # ── v2 NEW: owner settings + Z-Score engine + ATM-band vega/EV helpers ──
+    # Persist + read back owner settings
+    _test_settings = {"refresh_interval": 120, "vega_band_strikes": 5,
+                      "zscore_tf_minutes": 15, "zscore_lookback_buckets": 6,
+                      "selected_expiry": None}
+    _save_owner_settings(_test_settings)
+    _read_back = _load_owner_settings()
+    assert _read_back.get("refresh_interval") == 120
+    assert _read_back.get("vega_band_strikes") == 5
+    # Restore defaults
+    _save_owner_settings({"refresh_interval": REFRESH_SECS, "vega_band_strikes": 3,
+                          "zscore_tf_minutes": 15, "zscore_lookback_buckets": 6,
+                          "selected_expiry": None})
+
+    # ATM-band vega + EV ratio helpers
+    _rc, _rp, _oc, _op = _compute_atm_band_vegas(m["df_band"], m["atm"], 1000, 3)
+    assert _rc >= 0 and _rp >= 0
+    _ev_r, _ev_o = _compute_atm_band_ev_ratios(m["df_band"], spot, m["atm"], 1000, 3)
+    assert _ev_r > 0 and _ev_o > 0
+
+    # Z-Score engine helpers
+    _ts_list = ["2024-01-01 10:00:00", "2024-01-01 10:05:00", "2024-01-01 10:10:00",
+                "2024-01-01 10:15:00", "2024-01-01 10:20:00", "2024-01-01 10:25:00"]
+    _bkt = _make_tf_buckets(_ts_list, {"val": [1, 2, 3, 4, 5, 6]}, freq_min=5)
+    assert len(_bkt) >= 5
+    _z = _bucket_zscore(_bkt["val"], window_buckets=3)
+    assert len(_z) == len(_bkt)
+
+    # build_history_entry should now include the new ATM-band fields
+    _test_entry = build_history_entry(m, spot, "BTC", "10:30:00")
+    assert "atm_call_vega_raw" in _test_entry
+    assert "atm_put_vega_raw" in _test_entry
+    assert "atm_call_vega" in _test_entry
+    assert "atm_put_vega" in _test_entry
+    assert "ev_ratio_avg_strikewise" in _test_entry
+    assert "ev_ratio_oiw_avg_strikewise" in _test_entry
+    assert "vega_band_strikes" in _test_entry
+
     print("SELFTEST OK —",
           f"atm={m['atm']:,.0f} mp={m['max_pain']:,.0f} pcr={m['pcr']}",
           f"gex={m['gex']:,.0f} bias={bias['bias_score']:+.0f} {bias['direction']}",
-          f"strat={strat['name']} dw={cb['score']:+.1f} {cb['direction']}")
+          f"strat={strat['name']} dw={cb['score']:+.1f} {cb['direction']}",
+          f"smile=Sc{smile['scenario_id']:02d} grf={grf['total']}/10",
+          f"quad={cd['quadrant']} div_prox={ls['div_proximity']:.0f}",
+          f"shantanu_nd={sv['total_nd']:+,.0f} enh_ndm={sv['enh_total']:+,.0f}")
 
 
 if "--selftest" in sys.argv:
@@ -1193,11 +2540,14 @@ st.set_page_config(page_title="Shantanu's BTC Options Dashboard — Deribit",
 
 # Auto-refresh registered FIRST (CI #5 lesson from nifty v5: register before any
 # st.stop() can fire, so the page always self-recovers from API failures).
+# Page refresh is always 60s; data refresh interval is owner-controlled.
+# We use 60s for the page auto-refresh (data TTL is governed by cached_chain's
+# ttl parameter, which is set from owner settings).
 try:
     from streamlit_autorefresh import st_autorefresh
-    st_autorefresh(interval=REFRESH_SECS * 1000, key="auto_refresh")
+    st_autorefresh(interval=60 * 1000, key="auto_refresh")
 except Exception:
-    st.markdown(f"<meta http-equiv='refresh' content='{REFRESH_SECS}'>",
+    st.markdown(f"<meta http-equiv='refresh' content='60'>",
                 unsafe_allow_html=True)
 
 st.markdown(f"""
@@ -1224,24 +2574,261 @@ def kcard(col, label, value, color=TEXT, sub=""):
                  f"<div class='ksub'>{sub}</div></div>", unsafe_allow_html=True)
 
 
+# ─── Owner-mode sidebar (PIN-protected advanced settings) ────────────────────
+# Adapted from nifty_streamlit_v5_fixed.py. For crypto v2 we read OWNER_PIN
+# from environment variable (no Streamlit secrets dependency). If OWNER_PIN is
+# not set, owner controls are exposed UNLOCKED by default (since all data
+# sources are public and there are no trading credentials to protect). Set
+# OWNER_PIN env var to require PIN entry.
+def _get_owner_pin():
+    """Returns the OWNER_PIN env var or None if not set."""
+    return os.environ.get("OWNER_PIN") or None
+
+
+def _render_owner_sidebar(expiry_list):
+    """
+    Renders the sidebar with two modes:
+      - Locked (OWNER_PIN env var is set): PIN entry form only.
+      - Unlocked (OWNER_PIN env var is NOT set): all controls exposed openly.
+
+    Owner-mode controls:
+      • Expiry selector (persisted)
+      • Data refresh interval (persisted — governs cached_chain TTL)
+      • ATM Vega band width (persisted — governs all 4 Z-Score charts)
+      • Z-Score TF (time bucket) — persisted, governs all 4 Z-Score charts
+      • Z-Score look-back period — persisted, governs all 4 Z-Score charts
+      • Manual "Refresh Now" button
+
+    Returns: (sel_expiry, manual_refresh_clicked, effective_refresh_seconds)
+    """
+    import hmac
+    correct_pin = _get_owner_pin()
+
+    if "owner_unlocked" not in st.session_state:
+        # Default to unlocked if no PIN is configured
+        st.session_state.owner_unlocked = (correct_pin is None)
+
+    if "owner_pin_fail_count" not in st.session_state:
+        st.session_state.owner_pin_fail_count = 0
+    if "owner_pin_lock_until" not in st.session_state:
+        st.session_state.owner_pin_lock_until = 0.0
+
+    # Smart default for refresh (60s during typical active hours, 1800s otherwise)
+    if "refresh_seconds" not in st.session_state:
+        st.session_state.refresh_seconds = REFRESH_SECS
+
+    sel_expiry             = None
+    manual_refresh_clicked = False
+    effective_refresh      = REFRESH_SECS
+
+    with st.sidebar:
+        st.markdown("### ⚙️ Owner Controls")
+
+        # ── Locked path: PIN entry only ──────────────────────────────────────
+        if correct_pin is not None and not st.session_state.owner_unlocked:
+            _now_ts = time.time()
+            if _now_ts < st.session_state.owner_pin_lock_until:
+                _mins_left = int((st.session_state.owner_pin_lock_until - _now_ts) / 60) + 1
+                st.warning(f"⏱️ Too many failed attempts. Try again in {_mins_left} min.")
+            else:
+                st.caption("Enter PIN to access advanced settings.")
+                pin = st.text_input("Owner PIN", type="password",
+                                    key="owner_pin_input", placeholder="Enter owner PIN")
+                if st.button("Unlock", key="owner_unlock_btn", type="primary"):
+                    if pin and hmac.compare_digest(pin, correct_pin):
+                        st.session_state.owner_unlocked = True
+                        st.session_state.owner_pin_fail_count = 0
+                        st.rerun()
+                    else:
+                        st.session_state.owner_pin_fail_count += 1
+                        if st.session_state.owner_pin_fail_count >= 5:
+                            st.session_state.owner_pin_lock_until = _now_ts + 300
+                            st.session_state.owner_pin_fail_count = 0
+                            st.error("❌ Too many failed attempts. Locked for 5 minutes.")
+                        else:
+                            st.error(f"❌ Incorrect PIN (attempt "
+                                     f"{st.session_state.owner_pin_fail_count}/5)")
+            st.divider()
+            st.caption("🔒 Dashboard is in **read-only** mode for guests.")
+            return sel_expiry, manual_refresh_clicked, effective_refresh
+
+        # ── Unlocked path: full controls ─────────────────────────────────────
+        if correct_pin is not None:
+            st.success("🔓 Owner mode")
+
+        _cur = _load_owner_settings()
+
+        # Expiry selector (persisted)
+        if expiry_list:
+            _saved_exp = _cur.get("selected_expiry") or expiry_list[0]
+            _exp_idx = expiry_list.index(_saved_exp) if _saved_exp in expiry_list else 0
+            sel_expiry = st.selectbox("📅 Expiry", expiry_list,
+                                       index=_exp_idx, key="owner_expiry")
+            if sel_expiry != _cur.get("selected_expiry"):
+                _cur["selected_expiry"] = sel_expiry
+                _save_owner_settings(_cur)
+                st.cache_data.clear()
+        else:
+            st.caption("Expiry: Auto (nearest)")
+
+        st.divider()
+
+        # Refresh interval (persisted)
+        _saved_int = _cur.get("refresh_interval", REFRESH_SECS)
+        st.session_state.refresh_seconds = _saved_int
+        _cur_label = next((k for k, v in _REFRESH_OPTIONS.items() if v == _saved_int),
+                          list(_REFRESH_OPTIONS.keys())[1])
+        _chosen = st.selectbox(
+            "🔄 Data refresh interval",
+            list(_REFRESH_OPTIONS.keys()),
+            index=list(_REFRESH_OPTIONS.keys()).index(_cur_label),
+            key="refresh_selector",
+        )
+        _new_int = _REFRESH_OPTIONS[_chosen]
+        if _new_int != _saved_int:
+            _cur["refresh_interval"] = _new_int
+            _save_owner_settings(_cur)
+            st.session_state.refresh_seconds = _new_int
+            st.cache_data.clear()  # force re-fetch with new TTL
+        effective_refresh = _new_int
+        _mins = _new_int // 60
+        _secs = _new_int % 60
+        st.caption(f"Data refresh: **{_new_int}s** ({_mins}m {_secs}s) · "
+                   f"Page refresh: 60s (always)")
+
+        st.divider()
+
+        # ATM Vega band width — governs all 4 Z-Score charts
+        _saved_vb = _cur.get("vega_band_strikes", 3)
+        _vb_label = next((k for k, v in _VEGA_BAND_OPTIONS.items() if v == _saved_vb),
+                         "±3 strikes (default)")
+        _chosen_vb = st.selectbox(
+            "📐 ATM Vega band width",
+            list(_VEGA_BAND_OPTIONS.keys()),
+            index=list(_VEGA_BAND_OPTIONS.keys()).index(_vb_label),
+            key="vega_band_selector",
+            help="Number of strikes either side of ATM. Governs all 4 Z-Score "
+                 "charts (Raw & OI-Wtd Vega Ratio, Raw & OI-Wtd CE/PE EV Ratio). "
+                 "Takes effect on the next data fetch (forced immediately on change).",
+        )
+        _new_vb = _VEGA_BAND_OPTIONS[_chosen_vb]
+        if _new_vb != _saved_vb:
+            _cur["vega_band_strikes"] = _new_vb
+            _save_owner_settings(_cur)
+            st.cache_data.clear()  # recompute history entry with new band
+
+        st.divider()
+
+        # Z-Score TF — governs all 4 Z-Score charts
+        _saved_zs_tf = _cur.get("zscore_tf_minutes", 15)
+        _zs_tf_label = next((k for k, v in _ZS_TF_OPTIONS.items() if v == _saved_zs_tf),
+                            "15 min (default)")
+        _chosen_zs_tf = st.selectbox(
+            "📊 Z-Score chart TF (time bucket)",
+            list(_ZS_TF_OPTIONS.keys()),
+            index=list(_ZS_TF_OPTIONS.keys()).index(_zs_tf_label),
+            key="zscore_tf_selector",
+            help="Applies to all 4 Z-Score charts. Ticks are resampled into bars "
+                 "of this width (last value per bar); the in-progress bar updates "
+                 "every refresh and locks once its window closes.",
+        )
+        _new_zs_tf = _ZS_TF_OPTIONS[_chosen_zs_tf]
+        if _new_zs_tf != _saved_zs_tf:
+            _cur["zscore_tf_minutes"] = _new_zs_tf
+            _save_owner_settings(_cur)
+
+        # Z-Score look-back period
+        _saved_zs_lb = _cur.get("zscore_lookback_buckets", 6)
+        _zs_lb_label = next((k for k, v in _ZS_LOOKBACK_OPTIONS.items() if v == _saved_zs_lb),
+                            "6 bars")
+        _chosen_zs_lb = st.selectbox(
+            "📊 Z-Score look-back period",
+            list(_ZS_LOOKBACK_OPTIONS.keys()),
+            index=list(_ZS_LOOKBACK_OPTIONS.keys()).index(_zs_lb_label),
+            key="zscore_lookback_selector",
+            help="Number of TF bars the rolling Z-score window spans (5-10), "
+                 "e.g. 6 bars × 15-min TF = 90-min lookback.",
+        )
+        _new_zs_lb = _ZS_LOOKBACK_OPTIONS[_chosen_zs_lb]
+        if _new_zs_lb != _saved_zs_lb:
+            _cur["zscore_lookback_buckets"] = _new_zs_lb
+            _save_owner_settings(_cur)
+
+        st.divider()
+
+        # Manual refresh — owner only
+        if st.button("⟳ Refresh Now", key="owner_refresh_btn", type="primary"):
+            manual_refresh_clicked = True
+            st.cache_data.clear()
+
+        if correct_pin is not None:
+            st.divider()
+            if st.button("🔒 Lock", key="owner_lock_btn"):
+                st.session_state.owner_unlocked = False
+                if "owner_pin_input" in st.session_state:
+                    del st.session_state["owner_pin_input"]
+                st.rerun()
+
+    return sel_expiry, manual_refresh_clicked, effective_refresh
+
+
 # ─── Sidebar controls ─────────────────────────────────────────────────────────
+# Pick expiry list based on chosen exchange — done BEFORE the owner sidebar so
+# the owner expiry selector can use it.
+def _fetch_expiry_list_for(symbol, exchange):
+    if exchange == "OKX":
+        try: return fetch_okx_expiries(symbol) or fetch_expiries(symbol)
+        except Exception: return fetch_expiries(symbol)
+    elif exchange == "Bybit":
+        try: return fetch_bybit_expiries(symbol) or fetch_expiries(symbol)
+        except Exception: return fetch_expiries(symbol)
+    return fetch_expiries(symbol)
+
+
+# First sidebar pass: symbol + exchange (always visible)
 with st.sidebar:
-    st.markdown("### ⚙️ Controls")
+    st.markdown("### 📊 Symbol & Exchange")
     symbol = st.selectbox("Symbol", SYMBOLS, index=SYMBOLS.index(DEFAULT_SYMBOL))
-    exp_list = fetch_expiries(symbol)
-    exp_opts = [str(e) for e in exp_list] or ["(auto — nearest)"]
-    expiry_sel = st.selectbox("Expiry", exp_opts, index=0)
-    expiry_arg = None if expiry_sel.startswith("(") else expiry_sel
-    st.caption(f"Data: Deribit public API · refresh {REFRESH_SECS}s · 24/7 market")
+    exchange = st.selectbox("Options Exchange (chain source)", EXCHANGE_LIST, index=0,
+                            help="Deribit = native Greeks + DVOL · OKX = larger OI book · "
+                                 "Bybit = alt venue. Falls back to Deribit if the chosen venue fails.")
     if st.button("🔄 Force reload"):
         st.cache_data.clear()
         st.rerun()
 
+# Build expiry list for the chosen symbol/exchange
+_exp_list_raw = _fetch_expiry_list_for(symbol, exchange)
+_exp_opts     = [str(e) for e in _exp_list_raw] or ["(auto — nearest)"]
 
-# ─── Cached fetch (one Deribit pull per refresh window, shared by visitors) ──
-@st.cache_data(ttl=REFRESH_SECS, show_spinner="Fetching Deribit option chain…")
-def cached_chain(symbol, expiry_arg):
-    df, spot, exp = fetch_option_chain(symbol, expiry_arg)
+# Second sidebar pass: owner-mode controls (PIN-protected if OWNER_PIN env var is set)
+_owner_expiry, _manual_refresh, _effective_refresh = _render_owner_sidebar(_exp_opts)
+
+# Resolve effective expiry: owner selection wins, else auto-nearest
+if _owner_expiry and not _owner_expiry.startswith("("):
+    expiry_sel = _owner_expiry
+elif expiry_sel_default := next((e for e in _exp_opts if not e.startswith("(")), None):
+    expiry_sel = expiry_sel_default
+else:
+    expiry_sel = _exp_opts[0]
+expiry_arg = None if expiry_sel.startswith("(") else expiry_sel
+
+# Use owner-controlled refresh interval (defaults to REFRESH_SECS)
+REFRESH_SECS_EFFECTIVE = _effective_refresh or REFRESH_SECS
+
+with st.sidebar:
+    st.markdown("---")
+    st.markdown("#### 🌐 Free Data Sources")
+    st.caption(f"• **{exchange}** — options chain + OI + IV (free, no key)")
+    st.caption("• **Binance** — spot + perp funding (cross-venue triangulation)")
+    st.caption("• **CoinGecko** — aggregate spot reference (cross-venue)")
+    st.caption("• **Deribit DVOL** — crypto VIX (when available)")
+    st.caption(f"• Active refresh: {REFRESH_SECS_EFFECTIVE}s")
+
+
+# ─── Cached fetch (one exchange pull per refresh window, shared by visitors) ──
+@st.cache_data(ttl=REFRESH_SECS_EFFECTIVE, show_spinner=f"Fetching option chain…")
+def cached_chain(symbol, expiry_arg, exchange):
+    df, spot, exp = fetch_chain_multi(symbol, expiry_arg, exchange)
     return df, spot, (str(exp) if exp else None), datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 
@@ -1250,21 +2837,35 @@ def cached_dvol(symbol):
     return fetch_dvol(symbol)
 
 
-@st.cache_data(ttl=REFRESH_SECS)
+@st.cache_data(ttl=REFRESH_SECS_EFFECTIVE)
 def cached_perp(symbol):
     return fetch_perpetual(symbol)
 
 
-df, spot, expiry_str, tick_ts = cached_chain(symbol, expiry_arg)
+@st.cache_data(ttl=REFRESH_SECS_EFFECTIVE)
+def cached_cross_venue(symbol):
+    return fetch_cross_venue_spot(symbol)
+
+
+@st.cache_data(ttl=600)
+def cached_term_structure(symbol, front_exp, back_exp):
+    return fetch_term_structure_signal(symbol, front_exp, back_exp)
+
+
+df, spot, expiry_str, tick_ts = cached_chain(symbol, expiry_arg, exchange)
 
 if df.empty or spot == 0:
-    st.error("Deribit returned no data — will retry automatically on next refresh.")
+    st.error(f"{exchange} returned no data — will retry automatically on next refresh. "
+             f"(Falling back to Deribit on next tick if the issue persists.)")
     st.stop()
 
 m = compute_metrics(df, spot, symbol)
 if not m:
     st.error("Not enough strikes near ATM to compute metrics.")
     st.stop()
+
+# Tag the symbol onto m so smile classifier can pick up the right strike step
+m["_symbol"] = symbol
 
 df_band   = m.pop("df_band")
 df_signal = m.pop("df_signal")
@@ -1281,17 +2882,57 @@ if not hist or hist[-1].get("ts") != tick_ts:
 bias  = compute_bias(m, hist[:-1])
 strat = strategy_recommendation(bias, m, symbol)
 
+# ── v2 NEW: pre-compute all extra layers used by the new sections ────────────
+smile_state      = classify_iv_smile_scenario(df_band, m, spot)
+dvol_now, dvol_hist = cached_dvol(symbol)
+vix_signal       = fetch_vix_signal(dvol_now, dvol_hist)
+# Term structure: compare front expiry vs next one if available
+back_expiry_str  = None
+if len(exp_list) >= 2:
+    try:
+        back_expiry_str = str(exp_list[1] if (not expiry_arg or str(exp_list[0]) == expiry_arg) else exp_list[0])
+    except Exception:
+        back_expiry_str = None
+ts_signal        = cached_term_structure(symbol, expiry_arg, back_expiry_str) if back_expiry_str else {"available": False}
+# VWAP/OR for crypto: not implemented in v2 (no intraday candle source yet) — leave as None
+vwap_or          = None
+enhanced_bias    = compute_enhanced_price_bias(vwap_or, ts_signal, vix_signal,
+                                                safe_num(bias.get("bias_score", 0)), spot)
+combined_decision= generate_combined_decision(m, spot, bias, smile_state, hist,
+                                              vwap_or, ts_signal, vix_signal, enhanced_bias)
+grf              = _compute_grf(m, spot)
+leading_signals  = compute_leading_signals(m, bias, spot, hist, smile_state, exp_list)
+shantanu_view    = compute_shantanu_view(df_band, m, spot, symbol)
+cross_venue      = cached_cross_venue(symbol)
+
 # ─── Header ───────────────────────────────────────────────────────────────────
 coin_color = BTC_COLOR if symbol == "BTC" else ETH_COLOR
 st.markdown(f"""
 <div style="background:{ACCENT};border-radius:12px;padding:14px 22px;margin-bottom:8px;
             display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;color:white;">
   <div style="font-size:20px;font-weight:800;">📊 Shantanu's {symbol} Options Dashboard
-      <span style="font-weight:500;font-size:13px;opacity:.85;">Streamlit v1 · Deribit · same engine as NIFTY v5</span></div>
+      <span style="font-weight:500;font-size:13px;opacity:.85;">Streamlit v2 · {exchange} chain · same engine as NIFTY v5 + new sections</span></div>
   <div style="font-size:14px;font-weight:600;">
       Spot <span style="color:{coin_color};font-size:18px;font-weight:800;">${spot:,.0f}</span>
       &nbsp;·&nbsp; Exp {expiry_str} &nbsp;·&nbsp; {utc_str()} &nbsp;·&nbsp; tick {tick_ts}</div>
 </div>""", unsafe_allow_html=True)
+
+# ── v2 NEW: cross-venue spot triangulation strip (right under header) ────────
+_cv = cross_venue or {}
+if _cv.get("mean", 0) > 0:
+    _cv_spread = _cv.get("max_spread_pct", 0)
+    _cv_col   = GREEN if _cv_spread < 0.10 else (AMBER if _cv_spread < 0.30 else RED)
+    st.markdown(f"""
+    <div style='background:{CARD};border:1px solid {BORDER};border-radius:8px;
+                padding:8px 14px;margin-bottom:10px;display:flex;gap:18px;
+                align-items:center;flex-wrap:wrap;font-size:12px;'>
+      <span style='font-weight:800;color:{ACCENT};'>🌐 Cross-Venue Spot</span>
+      <span>Deribit <strong>${_cv.get('deribit',0):,.0f}</strong></span>
+      <span>Binance <strong>${_cv.get('binance',0):,.0f}</strong></span>
+      <span>CoinGecko <strong>${_cv.get('coingecko',0):,.0f}</strong></span>
+      <span>Mean <strong style='color:{coin_color};'>${_cv.get('mean',0):,.0f}</strong></span>
+      <span style='color:{_cv_col};font-weight:700;'>Max spread {_cv_spread:.4f}%</span>
+    </div>""", unsafe_allow_html=True)
 
 # ─── Section 1 — Market Sentiments ───────────────────────────────────────────
 sec("📡 Section 1 — Market Sentiments")
@@ -1448,7 +3089,7 @@ kcard(c[2], "Alert", vel["alert_level"], vcol, vel["alert_text"])
 
 # ─── Section 8 — DVOL + Perpetual Basis (VIX & futures-basis analogues) ──────
 sec("🌡️ Section 8 — DVOL (crypto VIX) · Perpetual Basis Triangulation")
-dvol_now, dvol_hist = cached_dvol(symbol)
+# dvol_now, dvol_hist already pre-computed above (used by Enhanced Bias layer)
 perp = cached_perp(symbol)
 c = st.columns(4)
 kcard(c[0], f"{symbol} DVOL", f"{dvol_now:.1f}" if dvol_now else "—", PINK,
@@ -1483,6 +3124,1041 @@ st.dataframe(
        .format(precision=4, thousands=","),
     use_container_width=True, height=520)
 
-st.caption(f"Deribit public API · no key required · OI in {symbol} contracts · "
-           f"option prices quoted in {symbol} · history {len(hist)} ticks · "
-           f"⚠ Educational analytics — not financial advice.")
+# ═════════════════════════════════════════════════════════════════════════════
+# v2 NEW SECTIONS — ported & adapted from nifty_streamlit_v5_fixed.py
+# All sections below this point are additions; existing Sections 1–9 above are
+# unchanged in behaviour. New sections:
+#   • Section 10 — ⚡ Enhanced Market Bias (4-layer composite)
+#   • Section 11 — 🎯 Combined Bias Decision (Quadrant + Action + Confidence)
+#   • Section 12 — 🔬 Greek Risk Framework (0–10 conviction)
+#   • Section 13 — 📈 S3/4 Bias vs Spot (5-min history chart)
+#   • Section 14 — ⚡ Gamma Data (Option C: GEX + Net Vega per strike)
+#   • Section 15 — 🔮 Leading Signals / Early Warning
+#   • Section 16 — 🎯 Shantanu's View (ND/NDM Decision Matrix + Enhanced NDM)
+#   • Section 17 — 🌐 Multi-Exchange OI Comparison (when chain from OKX/Bybit)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ─── Section 10 — ⚡ Enhanced Market Bias ────────────────────────────────────
+sec("⚡ Section 10 — Enhanced Market Bias (4-Layer Composite)")
+if enhanced_bias:
+    eb = enhanced_bias
+    esc   = eb["enhanced_score"]
+    ecol  = eb["color"]
+    edir  = eb["direction"]
+    econf = eb["enhanced_conf"]
+    eagr  = eb["agreement_pct"]
+    nsig  = eb["new_signals_available"]
+
+    def _chip(label, value, color, bg=None):
+        bg = bg or f"{color}18"
+        return (f'<span style="background:{bg};color:{color};border:1px solid {color};'
+                f'border-radius:5px;padding:2px 9px;font-size:11px;font-weight:700;'
+                f'white-space:nowrap;">{label}: {value}</span>')
+
+    bar_pct = int(abs(esc))
+    score_bar = (f'<div style="background:#F3F4F6;border-radius:4px;height:8px;margin:6px 0 4px 0;">'
+                 f'<div style="width:{bar_pct}%;background:{ecol};height:8px;border-radius:4px;'
+                 f'transition:width 0.4s;"></div></div>')
+
+    s34_col = "#059669" if eb["s34_score"] > 10 else ("#DC2626" if eb["s34_score"] < -10 else "#6B7280")
+    chips = " ".join([
+        _chip("S3/4",      f"{eb['s34_score']:+.0f}", s34_col),
+        _chip("VWAP/OR",   f"{eb['price_score']:+.0f}" if vwap_or else "—",
+              vwap_or.get("price_color","#6B7280") if vwap_or else "#6B7280"),
+        _chip("Term Struct", ts_signal.get("ts_label","—").replace(" ","_") if ts_signal.get("available") else "—",
+              ts_signal.get("ts_color","#6B7280") if ts_signal.get("available") else "#6B7280"),
+        _chip("DVOL/VIX",  f"{vix_signal.get('vix',0):.1f}" if vix_signal.get("available") else "—",
+              vix_signal.get("vix_color","#6B7280") if vix_signal.get("available") else "#6B7280"),
+    ])
+
+    detail_lines = []
+    if vwap_or and vwap_or.get("available"):
+        detail_lines.append(f'<div style="font-size:11px;color:#374151;padding:2px 0;">&#9642; '
+                            f'<strong>VWAP</strong> {vwap_or.get("vwap",0):,.1f} &nbsp;·&nbsp; '
+                            f'<span style="color:{vwap_or.get("price_color","#6B7280")};font-weight:700;">'
+                            f'{vwap_or.get("price_label","—")}</span></div>')
+    else:
+        detail_lines.append('<div style="font-size:11px;color:#9CA3AF;padding:2px 0;">'
+                            '&#9642; VWAP/OR: not yet implemented for crypto (no intraday candle source)</div>')
+
+    if ts_signal.get("available"):
+        detail_lines.append(f'<div style="font-size:11px;color:#374151;padding:2px 0;">&#9642; '
+                            f'<strong>Term Structure</strong> — front IV {ts_signal["front_iv"]:.1f}% vs '
+                            f'back {ts_signal["back_iv"]:.1f}% (diff {ts_signal["diff"]:+.1f}) · '
+                            f'<span style="color:{ts_signal["ts_color"]};font-weight:700;">'
+                            f'{ts_signal["ts_label"]}</span></div>')
+    else:
+        detail_lines.append('<div style="font-size:11px;color:#9CA3AF;padding:2px 0;">'
+                            '&#9642; Term Structure: single expiry only (back-month data unavailable)</div>')
+
+    if vix_signal.get("available"):
+        chg_str = (f' &nbsp;·&nbsp; Δ {vix_signal["vix_change"]:+.2f} pts this tick'
+                   if vix_signal.get("vix_change") is not None else "")
+        detail_lines.append(f'<div style="font-size:11px;color:#374151;padding:2px 0;">&#9642; '
+                            f'<strong>DVOL (crypto VIX)</strong> — {vix_signal["vix"]:.1f} · '
+                            f'<span style="color:{vix_signal["vix_color"]};font-weight:700;">'
+                            f'{vix_signal["vix_label"]}</span>{chg_str}</div>')
+    else:
+        detail_lines.append('<div style="font-size:11px;color:#9CA3AF;padding:2px 0;">'
+                            '&#9642; DVOL: unavailable</div>')
+
+    details_html = "\n".join(detail_lines)
+    agr_color = "#059669" if eagr >= 75 else ("#F59E0B" if eagr >= 50 else "#DC2626")
+    agr_label = "High agreement" if eagr >= 75 else ("Partial agreement" if eagr >= 50 else "Mixed signals")
+    conf_bar = (f'<div style="background:#F3F4F6;border-radius:4px;height:5px;margin-top:4px;">'
+                f'<div style="width:{int(econf)}%;background:{ecol};height:5px;border-radius:4px;"></div></div>')
+
+    st.markdown(f"""
+    <div style="background:#fff;border:2px solid {ecol};border-radius:12px;
+                padding:14px 20px 12px 24px;margin-bottom:14px;position:relative;
+                box-shadow:0 2px 8px rgba(0,0,0,0.07);">
+      <div style="position:absolute;left:0;top:0;bottom:0;width:6px;
+                  background:{ecol};border-radius:12px 0 0 12px;"></div>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px;">
+        <span style="font-size:16px;font-weight:900;color:#1A1A2E;">⚡ Enhanced Bias</span>
+        <span style="background:{ecol};color:#fff;border-radius:6px;padding:4px 14px;
+                     font-size:14px;font-weight:800;letter-spacing:0.5px;">{edir}</span>
+        <span style="background:{ecol}22;color:{ecol};border:1px solid {ecol};
+                     border-radius:6px;padding:2px 10px;font-size:13px;font-weight:800;">
+              {esc:+.0f} / 100</span>
+        <span style="background:{agr_color}22;color:{agr_color};border:1px solid {agr_color};
+                     border-radius:6px;padding:2px 9px;font-size:11px;font-weight:700;">
+              {agr_label} ({int(eagr)}%)</span>
+        <span style="margin-left:auto;font-size:10px;color:#9CA3AF;">{nsig}/3 new signals live</span>
+      </div>
+      {score_bar}
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 10px 0;">{chips}</div>
+      <div style="font-size:10px;color:#9CA3AF;margin-bottom:2px;">Composite confidence: {econf:.0f}%</div>
+      {conf_bar}
+      <div style="margin-top:10px;padding-top:10px;border-top:1px solid #F3F4F6;">{details_html}</div>
+    </div>""", unsafe_allow_html=True)
+else:
+    st.info("Enhanced bias layer not yet available — needs DVOL/term-structure signals.")
+
+
+# ─── Section 11 — 🎯 Combined Bias Decision ──────────────────────────────────
+sec("🎯 Section 11 — Combined Bias Decision (Quadrant · Action · Confidence)")
+cd = combined_decision
+qcolor  = cd["quadrant_color"]
+qbg     = cd["badge_bg"]
+qshort  = cd["quadrant_short"]
+action  = cd["action"]
+conf_l  = cd["confidence_label"]
+conf_c  = cd["confidence_color"]
+lines   = cd["explanation_lines"]
+div     = cd["divergence"]
+
+div_html = ""
+if div:
+    _div_strength = div.get("strength", "HARD")
+    _div_icon = "⚠" if _div_strength == "HARD" else "🔮"
+    _div_border = "solid" if _div_strength == "HARD" else "dashed"
+    _div_opacity = "1.0" if _div_strength == "HARD" else "0.75"
+    div_html = (f'<div style="background:{div["badge_bg"]};border:1.5px {_div_border} {div["color"]};'
+                f'border-radius:8px;padding:8px 14px;margin-top:10px;opacity:{_div_opacity};">'
+                f'<span style="font-size:12px;font-weight:800;color:{div["color"]};">'
+                f'{_div_icon} {_div_strength}: {div["type"]}</span>'
+                f'<div style="font-size:11.5px;color:#374151;margin-top:4px;">{div["warning"]}</div>'
+                f'<div style="font-size:11px;color:#6B7280;margin-top:3px;">{div["detail"]}</div>'
+                f'</div>')
+
+lines_html = "".join(
+    f'<div style="font-size:11.5px;color:#374151;padding:2px 0;line-height:1.5;">&#9656; {ln}</div>'
+    for ln in lines)
+
+_override_badge = ""
+if cd.get("quadrant_overridden"):
+    _override_badge = ("<span style='background:#FEF3C7;color:#B45309;"
+                       "border:1px dashed #B45309;border-radius:6px;"
+                       "padding:2px 9px;font-size:10px;font-weight:700;'>"
+                       "OVERRIDDEN by Price Layer</span>")
+_enh_html = ""
+if cd.get("enhanced_score", 0) != 0:
+    _enh_html = (f"<span>Enhanced Score: <strong style='color:#1A1A2E;'>"
+                 f"{cd['enhanced_score']:+.0f}</strong></span>")
+
+colour_bar = f"""<div style="position:absolute;left:0;top:0;bottom:0;width:5px;
+    background:{qcolor};border-radius:10px 0 0 10px;"></div>"""
+
+st.markdown(f"""
+<div style="background:{qbg};border:1.5px solid {qcolor};border-radius:10px;
+            padding:12px 18px 12px 22px;margin-bottom:12px;position:relative;">
+  {colour_bar}
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px;">
+    <span style="font-size:15px;font-weight:900;color:#1A1A2E;">🎯 Combined Bias Decision</span>
+    <span style="background:{qcolor};color:#fff;border-radius:6px;padding:3px 12px;
+                 font-size:13px;font-weight:800;letter-spacing:0.5px;">{qshort}</span>
+    <span style="background:{conf_c}33;color:{conf_c};border:1px solid {conf_c};
+                 border-radius:6px;padding:2px 9px;font-size:11px;font-weight:700;">
+          Confidence: {conf_l}</span>
+    {_override_badge}
+  </div>
+  <div style="font-size:12.5px;font-weight:700;color:{qcolor};margin-bottom:8px;letter-spacing:0.2px;">
+      {action}</div>
+  {lines_html}
+  <div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:8px;padding-top:8px;
+              border-top:1px solid #E5E7EB;font-size:11px;color:#6B7280;">
+    <span>S3/4 Score: <strong style="color:{qcolor};">{cd['s34_score']:+.0f}</strong> ({cd['s34_direction']})</span>
+    <span>IV Smile: <strong style="color:#374151;">{cd['smile_scenario']}</strong></span>
+    <span>PCR: <strong style="color:#374151;">{cd['pcr']:.2f}</strong></span>
+    {_enh_html}
+    <span style="margin-left:auto;font-size:10px;color:#9CA3AF;">
+          Combined Bias Engine (v2 inline)</span>
+  </div>
+  {div_html}
+</div>""", unsafe_allow_html=True)
+
+
+# ─── Section 12 — 🔬 Greek Risk Framework ────────────────────────────────────
+sec("🔬 Section 12 — Greek Risk Framework (0–10 Conviction Score)")
+_grf_dc = GREEN if grf["bias_s"] == "BULLISH" else (RED if grf["bias_s"] == "BEARISH" else AMBER)
+_grf_fac_html = "".join(
+    f'<div style="font-size:11px;color:#374151;padding:2px 0;line-height:1.4;">&#9656; {f}</div>'
+    for f in grf["fac"]) or '<div style="font-size:11px;color:#9CA3AF;">Collecting signals…</div>'
+
+def _gbar(v, mx, clr):
+    pct = int(v / mx * 100) if mx > 0 else 0
+    return (f'<div style="background:#F3F4F6;border-radius:4px;height:7px;margin-top:4px;">'
+            f'<div style="width:{pct}%;background:{clr};height:7px;border-radius:4px;"></div></div>')
+
+st.markdown(f"""
+<div style="background:#fff;border:1.5px solid {grf['cc']};border-radius:10px;
+            padding:14px 18px 12px 22px;margin-bottom:14px;position:relative;">
+  <div style="position:absolute;left:0;top:0;bottom:0;width:5px;
+              background:{grf['cc']};border-radius:10px 0 0 10px;"></div>
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+    <span style="background:{_grf_dc}22;color:{_grf_dc};border:1px solid {_grf_dc};
+                 border-radius:6px;padding:3px 12px;font-size:13px;font-weight:800;">
+          {grf['bias_s']}</span>
+    <span style="background:{grf['cc']}22;color:{grf['cc']};border:1px solid {grf['cc']};
+                 border-radius:6px;padding:2px 10px;font-size:12px;font-weight:700;">
+          {grf['conv']} &nbsp;·&nbsp; {grf['total']}/10</span>
+    <span style="font-size:11px;color:#6B7280;margin-left:auto;">
+          Gamma range: <strong>{grf['gamma_range']}</strong>
+          &nbsp;·&nbsp; Position size: <strong style="color:{grf['cc']};">{grf['sl']}</strong></span>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:10px;">
+    <div>
+      <div style="font-size:11px;font-weight:600;color:#6B7280;">
+          Gamma · Range quality &nbsp;<strong style="color:#1A1A2E;">{grf['g']}/3</strong></div>
+      {_gbar(grf['g'], 3, '#5DCAA5')}
+    </div>
+    <div>
+      <div style="font-size:11px;font-weight:600;color:#6B7280;">
+          Delta · Equilibrium &nbsp;<strong style="color:#1A1A2E;">{grf['d']}/3</strong></div>
+      {_gbar(grf['d'], 3, '#378ADD')}
+    </div>
+    <div>
+      <div style="font-size:11px;font-weight:600;color:#6B7280;">
+          Momentum · Flow &nbsp;<strong style="color:#1A1A2E;">{grf['ms']}/4</strong></div>
+      {_gbar(grf['ms'], 4, '#7F77DD')}
+    </div>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;
+              padding-top:10px;border-top:1px solid #F3F4F6;">
+    <div>
+      <div style="font-size:11px;font-weight:700;color:#374151;margin-bottom:4px;">Key signals</div>
+      {_grf_fac_html}
+    </div>
+    <div style="background:{grf['cc']}22;border-radius:8px;padding:10px 12px;">
+      <div style="font-size:11px;font-weight:700;color:{grf['cc']};margin-bottom:4px;">Recommendation</div>
+      <div style="font-size:12px;color:#374151;line-height:1.55;">{grf['rtxt']}</div>
+      <div style="font-size:10px;color:#9CA3AF;margin-top:6px;">
+          {grf['iv_env']} (IV rank {grf['iv_r']:.0f}) &nbsp;·&nbsp;
+          Sources: net delta · OI momentum · GEX · PCR · max pain</div>
+    </div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+
+# ─── Section 13 — 📈 S3/4 Bias vs Spot History ───────────────────────────────
+sec("📈 Section 13 — S3/4 Bias vs Spot (5-min snapshots)")
+if len(hist) >= 2:
+    _B_GREEN = "#22C55E"; _B_RED = "#EF4444"; _B_CYAN = "#22D3EE"
+    _bh_ts    = [r.get("ts","") for r in hist]
+    _bh_spot  = [safe_num(r.get("spot", 0)) for r in hist]
+    _bh_score = [safe_num(r.get("bias_score", 0)) for r in hist]
+
+    _bh_hover = []
+    for r in hist:
+        _hlines = [
+            f"<b>{r.get('ts','')}</b>",
+            f"Bias: <b>{safe_num(r.get('bias_score',0)):+.0f}</b>",
+            f"Spot: ${safe_num(r.get('spot',0)):,.0f}",
+        ]
+        for _sk, _lbl in [("momentum","S2 Mom"),("pcr","PCR"),("atm_iv","ATM IV")]:
+            if _sk in r:
+                _hlines.append(f"{_lbl}: {r[_sk]}")
+        _bh_hover.append("<br>".join(_hlines))
+
+    _bf = go.Figure()
+    _bf.add_hrect(y0=40,  y1=100,  fillcolor="#DCFCE7", opacity=0.25, layer="below", line_width=0)
+    _bf.add_hrect(y0=-15, y1=15,   fillcolor="#E5E7EB", opacity=0.35, layer="below", line_width=0)
+    _bf.add_hrect(y0=-100, y1=-40, fillcolor="#FEE2E2", opacity=0.25, layer="below", line_width=0)
+    for _rl, _rd, _rc in [(0,"dot","#9CA3AF"),(40,"dash","#86EFAC"),
+                          (-40,"dash","#FCA5A5"),(15,"dot","#D1D5DB"),(-15,"dot","#D1D5DB")]:
+        _bf.add_hline(y=_rl, line_width=1.2, line_dash=_rd, line_color=_rc)
+    _bf.add_trace(go.Scatter(
+        x=_bh_ts, y=_bh_spot, name=f"{symbol} Spot",
+        mode="lines+markers",
+        line=dict(color=_B_CYAN, width=2.2),
+        marker=dict(size=4, color=_B_CYAN),
+        yaxis="y2",
+        hovertemplate="%{x}<br>Spot: $%{y:,.0f}<extra>Spot</extra>",
+    ))
+    for _bi in range(len(_bh_score)):
+        _bc = _B_GREEN if _bh_score[_bi] >= 0 else _B_RED
+        if _bi < len(_bh_score) - 1:
+            _bf.add_trace(go.Scatter(
+                x=[_bh_ts[_bi], _bh_ts[_bi + 1]],
+                y=[_bh_score[_bi], _bh_score[_bi + 1]],
+                mode="lines",
+                line=dict(color=_bc, width=2.8),
+                showlegend=False, yaxis="y1", hoverinfo="skip",
+            ))
+        _bf.add_trace(go.Scatter(
+            x=[_bh_ts[_bi]], y=[_bh_score[_bi]],
+            mode="markers",
+            marker=dict(color=_bc, size=8, line=dict(color="#fff", width=1.5), symbol="circle"),
+            name="S3/4 Bias" if _bi == 0 else None,
+            showlegend=(_bi == 0),
+            customdata=[_bh_hover[_bi]],
+            hovertemplate="%{customdata}<extra></extra>",
+            yaxis="y1",
+        ))
+
+    _spot_vals  = [v for v in _bh_spot if v > 0]
+    _spot_pad   = (max(_spot_vals) - min(_spot_vals)) * 0.15 if len(_spot_vals) > 1 else 50
+    _spot_range = [min(_spot_vals) - _spot_pad, max(_spot_vals) + _spot_pad] if _spot_vals else None
+
+    _s34_bc = "#22C55E" if safe_num(bias.get("bias_score",0)) > 15 else \
+              ("#EF4444" if safe_num(bias.get("bias_score",0)) < -15 else "#F59E0B")
+    _bf.update_layout(
+        title=dict(
+            text=(f"S3/4 Market Bias vs {symbol} Spot — "
+                  f"<span style='color:{_s34_bc}'>{bias['direction']} {bias['bias_score']:+.0f}</span>"
+                  f"  <span style='font-size:11px;color:#9CA3AF'>· snapshots every {REFRESH_SECS}s</span>"),
+            font=dict(size=13, color="#1A1A2E"),
+        ),
+        height=270,
+        paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+        margin=dict(l=52, r=66, t=44, b=30),
+        font=dict(color="#1A1A2E", size=11),
+        legend=dict(orientation="h", y=1.14, x=0, font=dict(size=10)),
+        hovermode="closest",
+        yaxis=dict(
+            title=dict(text="Bias Score", font=dict(size=10, color="#1A1A2E")),
+            range=[-105, 105], zeroline=False,
+            gridcolor="#F3F4F6",
+            tickvals=[-100, -60, -40, -15, 0, 15, 40, 60, 100],
+            tickfont=dict(size=9),
+        ),
+        yaxis2=dict(
+            title=dict(text=f"{symbol} Spot", font=dict(size=10, color=_B_CYAN)),
+            overlaying="y", side="right",
+            showgrid=False, zeroline=False,
+            range=_spot_range,
+            tickfont=dict(size=9, color=_B_CYAN),
+        ),
+    )
+    st.plotly_chart(_bf, use_container_width=True, key="s34_hist")
+elif len(hist) == 1:
+    st.caption("⏳ Chart will appear after the second snapshot is recorded.")
+else:
+    st.caption("⏳ No history yet.")
+
+
+# ─── Section 14 — ⚡ Gamma Data (Option C: GEX + Net Vega per strike) ────────
+sec("⚡ Section 14 — Gamma Data (Option C: Standard GEX + Net Vega per Strike)")
+if df_band is not None and not df_band.empty:
+    _gd_src = df_band.copy()
+    for _gc in ["strike", "call_oi", "put_oi", "call_gamma", "put_gamma",
+                "call_vega", "put_vega"]:
+        if _gc in _gd_src.columns:
+            _gd_src[_gc] = pd.to_numeric(_gd_src[_gc], errors="coerce").fillna(0.0)
+    _gd_src = _gd_src.sort_values("strike").reset_index(drop=True)
+
+    _spot2 = spot ** 2
+    # Standard GEX: OI × Gamma × Spot² × 0.01  (notional-scaled)
+    # For crypto we don't have a lot size — Deribit OI is already in coin contracts
+    _gd_src["call_gex"] = _gd_src["call_oi"] * _gd_src["call_gamma"] * _spot2 * 0.01
+    _gd_src["put_gex"]  = _gd_src["put_oi"]  * _gd_src["put_gamma"]  * _spot2 * 0.01
+    _gd_src["net_gex"]  = _gd_src["call_gex"] - _gd_src["put_gex"]
+
+    _gd_src["call_vega_exp"] = _gd_src["call_oi"] * _gd_src["call_vega"]
+    _gd_src["put_vega_exp"]  = _gd_src["put_oi"]  * _gd_src["put_vega"]
+    _gd_src["net_vega"]      = _gd_src["call_vega_exp"] - _gd_src["put_vega_exp"]
+
+    _chart_gamma_flip = m.get("gamma_flip")
+    _gc_col1, _gc_col2 = st.columns(2)
+
+    with _gc_col1:
+        _gc1_fig = go.Figure()
+        _gc1_fig.add_trace(go.Bar(
+            x=_gd_src["strike"], y=_gd_src["call_gex"],
+            name="Call GEX (Dealer Buy — Pinning)",
+            marker_color="#EF4444", opacity=0.75,
+            hovertemplate="Strike %{x:,.0f}<br>Call GEX: %{y:,.2f}<extra>Dealer Buy / Pinning</extra>",
+        ))
+        _gc1_fig.add_trace(go.Bar(
+            x=_gd_src["strike"], y=-_gd_src["put_gex"],
+            name="Put GEX (Dealer Sell — Amplifying)",
+            marker_color="#22C55E", opacity=0.75,
+            hovertemplate="Strike %{x:,.0f}<br>Put GEX: %{y:,.2f}<extra>Dealer Sell / Amplifying</extra>",
+        ))
+        _gc1_fig.add_trace(go.Scatter(
+            x=_gd_src["strike"], y=_gd_src["net_gex"],
+            name="Net GEX", mode="lines+markers",
+            line=dict(color="#7C3AED", width=2.2),
+            marker=dict(size=5, color="#7C3AED"),
+            hovertemplate="Strike %{x:,.0f}<br>Net GEX: %{y:,.2f}<extra>Net GEX</extra>",
+        ))
+        _gc1_fig.add_vline(x=spot, line_dash="dash", line_color="#F59E0B", line_width=2,
+                           annotation_text=f"Spot ${spot:,.0f}",
+                           annotation_font=dict(size=10, color="#F59E0B"),
+                           annotation_position="top right")
+        if _chart_gamma_flip:
+            _gc1_fig.add_vline(x=_chart_gamma_flip, line_dash="dot",
+                               line_color="#10B981", line_width=1.8,
+                               annotation_text=f"Flip ${int(_chart_gamma_flip):,}",
+                               annotation_font=dict(size=9, color="#10B981"),
+                               annotation_position="top left")
+        _gc1_fig.update_layout(
+            title=dict(
+                text="Option C — Standard GEX per Strike  "
+                     "<span style='font-size:11px;color:#6B7280'>"
+                     "Red=Call (Pinning) · Green=Put (Amplifying) · Purple=Net</span>",
+                font=dict(size=13),
+            ),
+            barmode="overlay",
+            height=310,
+            paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+            margin=dict(l=55, r=20, t=50, b=30),
+            legend=dict(orientation="h", y=1.18, font=dict(size=10)),
+            yaxis=dict(
+                title="GEX  (OI × Γ × Spot² × 0.01)",
+                gridcolor="#F3F4F6",
+                zeroline=True, zerolinecolor="#9CA3AF", zerolinewidth=1.2,
+                tickfont=dict(size=9),
+            ),
+            xaxis=dict(title="Strike", tickfont=dict(size=9)),
+            font=dict(color="#1A1A2E", size=11),
+        )
+        st.plotly_chart(_gc1_fig, use_container_width=True, key="gex_per_strike")
+
+    with _gc_col2:
+        _gv_fig = go.Figure()
+        _gv_fig.add_trace(go.Bar(
+            x=_gd_src["strike"], y=_gd_src["call_vega_exp"],
+            name="Call Vega Exposure (ΣOI×Vega)",
+            marker_color="#2563EB", opacity=0.70,
+            hovertemplate="Strike %{x:,.0f}<br>Call Vega Exp: %{y:,.2f}<extra>Call-side Vega</extra>",
+        ))
+        _gv_fig.add_trace(go.Bar(
+            x=_gd_src["strike"], y=-_gd_src["put_vega_exp"],
+            name="Put Vega Exposure (shown negative)",
+            marker_color="#F59E0B", opacity=0.70,
+            hovertemplate="Strike %{x:,.0f}<br>Put Vega Exp: %{y:,.2f}<extra>Put-side Vega</extra>",
+        ))
+        _gv_fig.add_trace(go.Scatter(
+            x=_gd_src["strike"], y=_gd_src["net_vega"],
+            name="Net Vega", mode="lines+markers",
+            line=dict(color="#0891B2", width=2.2),
+            marker=dict(size=5, color="#0891B2"),
+            hovertemplate="Strike %{x:,.0f}<br>Net Vega: %{y:,.2f}<extra>Net Vega</extra>",
+        ))
+        _gv_fig.add_vline(x=spot, line_dash="dash", line_color="#F59E0B", line_width=2,
+                          annotation_text=f"Spot ${spot:,.0f}",
+                          annotation_font=dict(size=10, color="#F59E0B"),
+                          annotation_position="top right")
+        _gv_fig.update_layout(
+            title=dict(
+                text="Net Vega per Strike  "
+                     "<span style='font-size:11px;color:#6B7280'>"
+                     "Blue=Call · Orange=Put · Teal=Net · +ve=IV expansion zone</span>",
+                font=dict(size=13),
+            ),
+            barmode="overlay",
+            height=310,
+            paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+            margin=dict(l=55, r=20, t=50, b=30),
+            legend=dict(orientation="h", y=1.18, font=dict(size=10)),
+            yaxis=dict(
+                title="Vega Exposure  (OI × Vega)",
+                gridcolor="#F3F4F6",
+                zeroline=True, zerolinecolor="#9CA3AF", zerolinewidth=1.2,
+                tickfont=dict(size=9),
+            ),
+            xaxis=dict(title="Strike", tickfont=dict(size=9)),
+            font=dict(color="#1A1A2E", size=11),
+        )
+        st.plotly_chart(_gv_fig, use_container_width=True, key="vega_per_strike")
+else:
+    st.info("Option chain band is empty — cannot compute Gamma Data.")
+
+
+# ─── Section 15 — 🔮 Leading Signals / Early Warning ─────────────────────────
+sec("🔮 Section 15 — Leading Signals / Early Warning")
+_ls_col1, _ls_col2, _ls_col3 = st.columns(3)
+
+with _ls_col1:
+    _dp = leading_signals.get("div_proximity", 0)
+    _dp_color = "#DC2626" if _dp >= 60 else ("#F59E0B" if _dp >= 35 else "#059669")
+    _dp_label = "APPROACHING DIVERGENCE" if _dp >= 60 else ("WATCHING" if _dp >= 35 else "CLEAR")
+    st.markdown(f"""
+    <div style='background:{CARD};border:1px solid {BORDER};border-radius:10px;
+                padding:12px 14px;margin-bottom:10px;'>
+      <div style="font-size:11px;font-weight:700;color:{MUTED};text-transform:uppercase;">Divergence Proximity</div>
+      <div style="font-size:28px;font-weight:900;color:{_dp_color};margin:6px 0;">{_dp:.0f} / 100</div>
+      <div style="background:#E5E7EB;border-radius:4px;height:6px;margin:4px 0;">
+        <div style="background:{_dp_color};height:6px;border-radius:4px;width:{_dp}%;"></div>
+      </div>
+      <div style="font-size:12px;font-weight:700;color:{_dp_color};">{_dp_label}</div>
+      <div style="font-size:10px;color:#9CA3AF;margin-top:4px;">Fires at 60+ — early warning before divergences trigger</div>
+    </div>""", unsafe_allow_html=True)
+
+    _vel = leading_signals.get("velocity", 0)
+    _acc = leading_signals.get("acceleration", 0)
+    _vel_color = "#059669" if _vel > 2 else ("#DC2626" if _vel < -2 else "#6B7280")
+    _vel_label = "ACCELERATING BULL" if _vel > 5 else ("ACCELERATING BEAR" if _vel < -5 else "STEADY")
+    st.markdown(f"""
+    <div style='background:{CARD};border:1px solid {BORDER};border-radius:10px;padding:12px 14px;'>
+      <div style="font-size:11px;font-weight:700;color:{MUTED};text-transform:uppercase;">Bias Velocity</div>
+      <div style="font-size:28px;font-weight:900;color:{_vel_color};margin:6px 0;">{_vel:+.1f} pts/tick</div>
+      <div style="font-size:12px;font-weight:700;color:{_vel_color};">{_vel_label}</div>
+      <div style="font-size:10px;color:#9CA3AF;margin-top:4px;">Acceleration: {_acc:+.1f} pts/tick²</div>
+    </div>""", unsafe_allow_html=True)
+
+with _ls_col2:
+    _gfp = leading_signals.get("gamma_flip_proximity")
+    if _gfp:
+        _gfp_color = "#DC2626" if _gfp["regime_risk"] == "HIGH" else ("#F59E0B" if _gfp["regime_risk"] == "ELEVATED" else "#059669")
+        st.markdown(f"""
+        <div style='background:{CARD};border:1px solid {BORDER};border-radius:10px;padding:12px 14px;margin-bottom:10px;'>
+          <div style="font-size:11px;font-weight:700;color:{MUTED};text-transform:uppercase;">Gamma Flip Proximity</div>
+          <div style="font-size:16px;font-weight:800;color:#1A1A2E;">Flip @ ${_gfp["flip_strike"]:,.0f}</div>
+          <div style="font-size:13px;color:{_gfp_color};font-weight:700;">Spot {_gfp["side"]} by ${_gfp["distance_pts"]:,.0f} ({_gfp["pct_of_threshold"]:.0f}% of threshold)</div>
+          <div style="background:#E5E7EB;border-radius:4px;height:6px;margin:4px 0;">
+            <div style="background:{_gfp_color};height:6px;border-radius:4px;width:{min(100, _gfp["pct_of_threshold"])}%;"></div>
+          </div>
+          <div style="font-size:12px;font-weight:700;color:{_gfp_color};">Risk: {_gfp["regime_risk"]}</div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div style="background:{CARD};border:1px solid {BORDER};border-radius:10px;padding:12px 14px;margin-bottom:10px;">'
+                    f'<div style="font-size:11px;font-weight:700;color:{MUTED};">Gamma Flip Proximity</div>'
+                    f'<div style="font-size:12px;color:#9CA3AF;margin-top:6px;">No gamma flip detected</div></div>',
+                    unsafe_allow_html=True)
+
+    _oe = leading_signals.get("oi_exhaustion")
+    if _oe:
+        st.markdown(f"""
+        <div style='background:{CARD};border:1px solid {BORDER};border-radius:10px;padding:12px 14px;'>
+          <div style="font-size:11px;font-weight:700;color:{MUTED};text-transform:uppercase;">OI Momentum Exhaustion</div>
+          <div style="font-size:16px;font-weight:800;color:{_oe["color"]};">{_oe["label"]}</div>
+          <div style="font-size:12px;color:#374151;">{_oe["direction"]} flow exhaust ratio: {_oe["exhaust_ratio"]:.2f}</div>
+          <div style="background:#E5E7EB;border-radius:4px;height:6px;margin:4px 0;">
+            <div style="background:{_oe["color"]};height:6px;border-radius:4px;width:{min(100, _oe["exhaust_ratio"] * 100)}%;"></div>
+          </div>
+          <div style="font-size:10px;color:#9CA3AF;margin-top:4px;">Ratio <0.50 = exhaustion (reversal risk)</div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div style="background:{CARD};border:1px solid {BORDER};border-radius:10px;padding:12px 14px;">'
+                    f'<div style="font-size:11px;font-weight:700;color:{MUTED};">OI Momentum Exhaustion</div>'
+                    f'<div style="font-size:12px;color:#9CA3AF;margin-top:6px;">Need 5+ ticks of history</div></div>',
+                    unsafe_allow_html=True)
+
+with _ls_col3:
+    # IV smile scenario card
+    st.markdown(f"""
+    <div style='background:{CARD};border:1px solid {smile_state.get("color",BORDER)};border-radius:10px;padding:12px 14px;margin-bottom:10px;'>
+      <div style="font-size:11px;font-weight:700;color:{MUTED};text-transform:uppercase;">IV Smile Scenario</div>
+      <div style="font-size:16px;font-weight:800;color:{smile_state.get("color","#1A1A2E")};">Sc{smile_state.get("scenario_id",0):02d} — {smile_state.get("name","—")}</div>
+      <div style="font-size:12px;color:#374151;">Bucket: <strong>{smile_state.get("bucket","—")}</strong></div>
+      <div style="font-size:11px;color:#6B7280;margin-top:4px;">
+          Put skew: {smile_state.get("put_skew",0):+.1f} · Call skew: {smile_state.get("call_skew",0):+.1f}
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+    # DVOL/VIX signal card
+    if vix_signal.get("available"):
+        st.markdown(f"""
+        <div style='background:{CARD};border:1px solid {vix_signal["vix_color"]};border-radius:10px;padding:12px 14px;'>
+          <div style="font-size:11px;font-weight:700;color:{MUTED};text-transform:uppercase;">DVOL / Crypto VIX</div>
+          <div style="font-size:24px;font-weight:900;color:{vix_signal["vix_color"]};">{vix_signal["vix"]:.1f}</div>
+          <div style="font-size:12px;font-weight:700;color:{vix_signal["vix_color"]};">{vix_signal["vix_label"]}</div>
+          <div style="font-size:10px;color:#9CA3AF;margin-top:4px;">Percentile: {vix_signal["vix_pctile"]:.0f}%</div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div style="background:{CARD};border:1px solid {BORDER};border-radius:10px;padding:12px 14px;">'
+                    f'<div style="font-size:11px;font-weight:700;color:{MUTED};">DVOL / Crypto VIX</div>'
+                    f'<div style="font-size:12px;color:#9CA3AF;margin-top:6px;">DVOL unavailable</div></div>',
+                    unsafe_allow_html=True)
+
+
+# ─── Section 16 — 🎯 Shantanu's View (ND/NDM Decision Matrix) ───────────────
+sec("🎯 Section 16 — Shantanu's View (ND/NDM Decision Matrix + Enhanced NDM)")
+if shantanu_view.get("available"):
+    sv = shantanu_view
+    ec1, ec2, ec3 = st.columns([1, 1, 2])
+    with ec1:
+        st.markdown(f"""
+        <div style="background:#F8F7FF;border:1.5px solid #7C3AED;border-radius:10px;padding:14px 16px;text-align:center;">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Total ND</div>
+          <div style="font-size:24px;font-weight:900;color:{'#059669' if sv['total_nd'] > 0 else '#DC2626' if sv['total_nd'] < 0 else '#6B7280'};">{sv['total_nd']:+,.0f}</div>
+          <div style="font-size:10px;color:#9CA3AF;margin-top:3px;">Net Delta (OI-weighted)</div>
+        </div>""", unsafe_allow_html=True)
+    with ec2:
+        st.markdown(f"""
+        <div style="background:#F9FAFB;border:1.5px solid #E5E7EB;border-radius:10px;padding:14px 16px;text-align:center;">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Total NDM</div>
+          <div style="font-size:24px;font-weight:900;color:{'#059669' if sv['total_ndm'] > 0 else '#DC2626' if sv['total_ndm'] < 0 else '#6B7280'};">{sv['total_ndm']:+,.0f}</div>
+          <div style="font-size:10px;color:#9CA3AF;margin-top:3px;">Net Delta Momentum (Δ-weighted OI chg)</div>
+        </div>""", unsafe_allow_html=True)
+    with ec3:
+        st.markdown(f"""
+        <div style="background:{sv['signal_bg']};border:1.5px solid {sv['signal_color']};border-radius:10px;padding:14px 16px;">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Raw NDM Signal Interpretation</div>
+          <div style="font-size:13px;font-weight:800;color:{sv['signal_color']};line-height:1.5;">{sv['signal']}</div>
+          <div style="font-size:10px;color:#9CA3AF;margin-top:4px;">EV ratio this tick: {sv['ev_ratio']:.3f}</div>
+        </div>""", unsafe_allow_html=True)
+
+    # ── Sub-section: Enhanced NDM (Buyer/Writer Adjusted) ────────────────────
+    st.markdown(
+        '<div style="font-size:16px;font-weight:900;color:#7C3AED;letter-spacing:0.4px;'
+        'padding:14px 0 6px 0;border-top:2px solid #E5E7EB;margin-top:16px;margin-bottom:8px;">'
+        '🔬 Enhanced NDM — Buyer / Writer Adjusted</div>',
+        unsafe_allow_html=True)
+    st.caption(
+        "Raw NDM assumes ALL OI addition is buyer-driven. Enhanced NDM corrects this using the "
+        "raw Call/Put Extrinsic Value ratio: EV ratio > 1 → Call buyer / Put writer; "
+        "EV ratio < 1 → Put buyer / Call writer. The MM takes the opposite side of the buyer, "
+        "reversing the hedge direction. If Enhanced NDM diverges from Raw NDM, the raw signal is unreliable.")
+
+    _ec1, _ec2, _ec3 = st.columns([1, 1, 2])
+    with _ec1:
+        st.markdown(f"""
+        <div style="background:#F8F7FF;border:1.5px solid #7C3AED;border-radius:10px;padding:14px 16px;text-align:center;">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Enhanced NDM</div>
+          <div style="font-size:24px;font-weight:900;color:{'#059669' if sv['enh_total'] > 0 else '#DC2626' if sv['enh_total'] < 0 else '#6B7280'};">{sv['enh_total']:+,.0f}</div>
+          <div style="font-size:10px;color:#9CA3AF;margin-top:3px;">Buyer/Writer Adjusted</div>
+        </div>""", unsafe_allow_html=True)
+    with _ec2:
+        _endm_rc = "#059669" if sv["raw_total"] > 0 else "#DC2626" if sv["raw_total"] < 0 else "#6B7280"
+        st.markdown(f"""
+        <div style="background:#F9FAFB;border:1.5px solid #E5E7EB;border-radius:10px;padding:14px 16px;text-align:center;">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Raw NDM</div>
+          <div style="font-size:24px;font-weight:900;color:{_endm_rc};">{sv['raw_total']:+,.0f}</div>
+          <div style="font-size:10px;color:#9CA3AF;margin-top:3px;">Standard Formula</div>
+        </div>""", unsafe_allow_html=True)
+    with _ec3:
+        # Reuse the signal card (already computed)
+        st.markdown(f"""
+        <div style="background:{sv['signal_bg']};border:1.5px solid {sv['signal_color']};border-radius:10px;padding:14px 16px;">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Signal Interpretation</div>
+          <div style="font-size:13px;font-weight:800;color:{sv['signal_color']};line-height:1.5;">{sv['signal']}</div>
+          <div style="font-size:10px;color:#9CA3AF;margin-top:4px;">Divergence = Raw NDM unreliable. Trust Enhanced NDM + cross-check DVOL &amp; PCR.</div>
+        </div>""", unsafe_allow_html=True)
+
+    with st.expander("📊 Strike-by-Strike Enhanced NDM Breakdown", expanded=False):
+        st.caption(
+            f"Raw Call/Put EV ratio this tick: **{sv['ev_ratio']:.3f}**. "
+            "↑ Buyer = this side is buyer-dominated per the EV ratio (MM hedges WITH the move). "
+            "↓ Writer = this side is writer-dominated (MM hedges AGAINST the move, flipping sign).")
+        _endm_df = pd.DataFrame(sv["enhanced_rows"]).sort_values("Strike", ascending=False)
+        def _endm_style(val):
+            if isinstance(val, (int, float)):
+                if val > 0:   return "color:#059669;font-weight:700"
+                elif val < 0: return "color:#DC2626;font-weight:700"
+            return ""
+        st.dataframe(
+            _endm_df.style.map(_endm_style, subset=["Enhanced NDM", "Raw NDM"]),
+            use_container_width=True, hide_index=True)
+else:
+    st.info("⏳ Shantanu's View: Waiting for option chain data to initialise.")
+
+
+# ─── Section 17 — 🌐 Multi-Exchange Snapshot ────────────────────────────────
+sec("🌐 Section 17 — Multi-Exchange Snapshot (Cross-Venue Reference)")
+me_c1, me_c2, me_c3 = st.columns(3)
+with me_c1:
+    st.markdown(f"""
+    <div style='background:{CARD};border:1px solid {BORDER};border-radius:10px;padding:12px 14px;'>
+      <div style="font-size:11px;font-weight:700;color:{MUTED};text-transform:uppercase;">Chain Source</div>
+      <div style="font-size:18px;font-weight:800;color:{ACCENT};">{exchange}</div>
+      <div style="font-size:11px;color:#6B7280;margin-top:4px;">
+          Strikes in band: {len(df_band)} · ATM ${m.get('atm', 0):,.0f}</div>
+    </div>""", unsafe_allow_html=True)
+with me_c2:
+    binance_data = fetch_binance_spot(symbol)
+    if binance_data.get("spot", 0) > 0:
+        st.markdown(f"""
+        <div style='background:{CARD};border:1px solid {BORDER};border-radius:10px;padding:12px 14px;'>
+          <div style="font-size:11px;font-weight:700;color:{MUTED};text-transform:uppercase;">Binance Spot + Perp</div>
+          <div style="font-size:18px;font-weight:800;color:{TEXT};">${binance_data['spot']:,.0f}</div>
+          <div style="font-size:11px;color:#6B7280;margin-top:4px;">
+              Perp mark ${binance_data['perp_mark']:,.0f} · Funding {binance_data['funding_rate']*100:+.4f}%</div>
+        </div>""", unsafe_allow_html=True)
+with me_c3:
+    if vix_signal.get("available"):
+        st.markdown(f"""
+        <div style='background:{CARD};border:1px solid {vix_signal["vix_color"]};border-radius:10px;padding:12px 14px;'>
+          <div style="font-size:11px;font-weight:700;color:{MUTED};text-transform:uppercase;">Deribit DVOL (crypto VIX)</div>
+          <div style="font-size:18px;font-weight:800;color:{vix_signal["vix_color"]};">{vix_signal["vix"]:.1f}</div>
+          <div style="font-size:11px;color:#6B7280;margin-top:4px;">{vix_signal["vix_label"]} · pctile {vix_signal["vix_pctile"]:.0f}%</div>
+        </div>""", unsafe_allow_html=True)
+
+st.caption(f"{exchange} chain · Binance + CoinGecko cross-venue · Deribit DVOL · "
+           f"history {len(hist)} ticks · ⚠ Educational analytics — not financial advice.")
+
+
+# ─── Section 18 — 📊 CE/PE Vega + Extrinsic-Value Z-Score Charts (4-panel) ───
+# Adapted from nifty_streamlit_v5_fixed.py. Four charts, all driven by the
+# owner-configurable Z-Score engine (TF + look-back) and ATM Vega band width:
+#   A. Raw Vega Ratio Z-Score          — Σcall_vega / Σput_vega (no OI weighting)
+#   B. OI-Weighted Vega Ratio Z-Score  — Σ(call_oi×call_vega) / Σ(put_oi×put_vega)
+#   C. Raw CE/PE EV Ratio Z-Score      — strike-wise avg of (call_ev / put_ev)
+#   D. OI-Wtd CE/PE EV Ratio Z-Score   — strike-wise avg of (call_ev×call_oi / put_ev×put_oi)
+# Each chart is a dual-axis time-series: amber line = spot (left), coloured
+# line = Z-Score (right) with ±1σ / ±2σ reference lines.
+# ─────────────────────────────────────────────────────────────────────────────
+sec("📊 Section 18 — CE/PE Vega & Extrinsic-Value Ratio Z-Scores (4-Panel)")
+
+# Read owner-controlled Z-Score settings
+_zs_settings        = _load_owner_settings()
+_ZS_BUCKET_MIN      = int(_zs_settings.get("zscore_tf_minutes", 15))
+_ZS_BUCKET_LOOKBACK = int(_zs_settings.get("zscore_lookback_buckets", 6))
+_VEGA_BAND_N        = int(_zs_settings.get("vega_band_strikes", 3))
+_lookback_label     = f"{_ZS_BUCKET_LOOKBACK}×{_ZS_BUCKET_MIN}m bars ({_ZS_BUCKET_LOOKBACK * _ZS_BUCKET_MIN}min lookback)"
+
+st.caption(f"**Active Z-Score engine:** TF = {_ZS_BUCKET_MIN} min · look-back = {_ZS_BUCKET_LOOKBACK} bars · "
+           f"ATM band = ±{_VEGA_BAND_N} strikes  →  {_lookback_label}. "
+           "Adjust these via the owner-mode sidebar (⚙️ Owner Controls → Z-Score settings).")
+
+
+def _add_atm_change_annotations(fig, times, atm_ks):
+    """Draw grey dashed vlines + ATM-shift labels (avoids mean() crash on string x-axis)."""
+    _prev = None
+    for _ti, _ak in zip(times, atm_ks):
+        if _ak and _ak != _prev and _prev is not None:
+            fig.add_vline(x=_ti, line_dash="dash", line_color="#6B7280",
+                          line_width=1, opacity=0.5)
+            fig.add_annotation(x=_ti, y=0.95, xref="x", yref="paper",
+                               text=f"ATM→{_ak:,.0f}", font=dict(size=8, color="#6B7280"),
+                               showarrow=False, xanchor="left")
+        _prev = _ak
+
+
+def _add_sigma_lines(fig, color, yref="y2"):
+    """Mean (0σ) line + ±1σ / ±2σ level markers, all on the right Z-Score axis."""
+    fig.add_hline(y=0, yref=yref, line_dash="dot",
+                  line_color=color, line_width=1.5, opacity=0.6)
+    fig.add_annotation(x=1, y=0, xref="paper", yref=yref,
+                       text="Mean (0σ)", font=dict(size=9, color=color),
+                       showarrow=False, xanchor="left")
+    for _zlvl, _zcol, _zdash in [(1, color, "dash"), (-1, color, "dash"),
+                                  (2, "#DC2626", "dashdot"), (-2, "#DC2626", "dashdot")]:
+        fig.add_hline(y=_zlvl, yref=yref, line_dash=_zdash,
+                       line_color=_zcol, line_width=1, opacity=0.5)
+        fig.add_annotation(x=1, y=_zlvl, xref="paper", yref=yref,
+                           text=f"{_zlvl:+d}σ", font=dict(size=8, color=_zcol),
+                           showarrow=False, xanchor="left")
+
+
+# ── Build time-series arrays from history (only ticks with non-zero vega) ──
+_vd_ts_full, _vd_spot, _vd_atm_k = [], [], []
+_vd_raw_ratio, _vd_oiw_ratio     = [], []
+_evz_ts_full, _evz_spot, _evz_atm_k = [], [], []
+_evz_raw_ratio, _evz_oiw_ratio   = [], []
+
+for _h in hist:
+    _cv_raw = _h.get("atm_call_vega_raw")
+    _pv_raw = _h.get("atm_put_vega_raw")
+    _cv_oiw = _h.get("atm_call_vega")
+    _pv_oiw = _h.get("atm_put_vega")
+    if (_cv_raw is not None and _pv_raw is not None and float(_pv_raw) != 0 and
+        _cv_oiw is not None and _pv_oiw is not None and float(_pv_oiw) != 0 and
+        _h.get("spot")):
+        _vd_ts_full.append(_h["ts"])
+        _vd_spot.append(float(_h["spot"]))
+        _vd_raw_ratio.append(round(float(_cv_raw) / float(_pv_raw), 4))
+        _vd_oiw_ratio.append(round(float(_cv_oiw) / float(_pv_oiw), 4))
+        _vd_atm_k.append(int(_h.get("atm", 0)))
+
+    _evr     = _h.get("ev_ratio_avg_strikewise")
+    _evr_oiw = _h.get("ev_ratio_oiw_avg_strikewise")
+    if _evr is not None and _evr_oiw is not None and _h.get("spot"):
+        _evz_ts_full.append(_h["ts"])
+        _evz_spot.append(float(_h["spot"]))
+        _evz_raw_ratio.append(float(_evr))
+        _evz_oiw_ratio.append(float(_evr_oiw))
+        _evz_atm_k.append(int(_h.get("atm", 0)))
+
+# ── Bucket + Z-score for Vega Ratio ─────────────────────────────────────────
+_vd_times, _vd_raw_z, _vd_oiw_z = [], [], []
+if len(_vd_ts_full) >= 2:
+    _vd_bkt = _make_tf_buckets(
+        _vd_ts_full,
+        {"spot": _vd_spot, "atm": _vd_atm_k, "raw_ratio": _vd_raw_ratio, "oiw_ratio": _vd_oiw_ratio},
+        freq_min=_ZS_BUCKET_MIN,
+    )
+    if not _vd_bkt.empty:
+        _vd_times     = _vd_bkt.index.strftime("%H:%M").tolist()
+        _vd_spot      = _vd_bkt["spot"].tolist()
+        _vd_atm_k     = _vd_bkt["atm"].astype(int).tolist()
+        _vd_raw_ratio = _vd_bkt["raw_ratio"].tolist()
+        _vd_oiw_ratio = _vd_bkt["oiw_ratio"].tolist()
+        _vd_raw_z     = _bucket_zscore(_vd_bkt["raw_ratio"], _ZS_BUCKET_LOOKBACK).tolist()
+        _vd_oiw_z     = _bucket_zscore(_vd_bkt["oiw_ratio"], _ZS_BUCKET_LOOKBACK).tolist()
+
+# ── Bucket + Z-score for EV Ratio ───────────────────────────────────────────
+_evz_times, _evz_raw_z, _evz_oiw_z = [], [], []
+if len(_evz_ts_full) >= 2:
+    _evz_bkt = _make_tf_buckets(
+        _evz_ts_full,
+        {"spot": _evz_spot, "atm": _evz_atm_k, "raw_ratio": _evz_raw_ratio, "oiw_ratio": _evz_oiw_ratio},
+        freq_min=_ZS_BUCKET_MIN,
+    )
+    if not _evz_bkt.empty:
+        _evz_times     = _evz_bkt.index.strftime("%H:%M").tolist()
+        _evz_spot      = _evz_bkt["spot"].tolist()
+        _evz_atm_k     = _evz_bkt["atm"].astype(int).tolist()
+        _evz_raw_ratio = _evz_bkt["raw_ratio"].tolist()
+        _evz_oiw_ratio = _evz_bkt["oiw_ratio"].tolist()
+        _evz_raw_z     = _bucket_zscore(_evz_bkt["raw_ratio"], _ZS_BUCKET_LOOKBACK).tolist()
+        _evz_oiw_z     = _bucket_zscore(_evz_bkt["oiw_ratio"], _ZS_BUCKET_LOOKBACK).tolist()
+
+
+# ── Chart A: Raw Vega Ratio Z-Score ─────────────────────────────────────────
+if len(_vd_times) >= 2:
+    _vd_col1, _vd_col2 = st.columns(2)
+
+    with _vd_col1:
+        _vr_fig = go.Figure()
+        _vr_fig.add_trace(go.Scatter(
+            x=_vd_times, y=_vd_spot,
+            name=f"{symbol} Spot",
+            mode="lines",
+            line=dict(color="#F59E0B", width=2.5),
+            yaxis="y1",
+            hovertemplate="%{x}<br>Spot: <b>$%{y:,.0f}</b><extra>Spot</extra>",
+        ))
+        _vr_fig.add_trace(go.Scatter(
+            x=_vd_times, y=_vd_raw_z,
+            name=f"Raw Vega Ratio Z-Score ({_lookback_label}, ±{_VEGA_BAND_N} strikes)",
+            mode="lines+markers",
+            line=dict(color="#7C3AED", width=2.0),
+            marker=dict(size=4, color="#7C3AED"),
+            yaxis="y2",
+            customdata=_vd_raw_ratio,
+            hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>Raw Ratio: %{customdata:.4f}"
+                          "<extra>Σcall_vega / Σput_vega</extra>",
+        ))
+        _add_sigma_lines(_vr_fig, "#7C3AED")
+        _add_atm_change_annotations(_vr_fig, _vd_times, _vd_atm_k)
+        _vr_fig.update_layout(
+            title=dict(
+                text=f"Raw Vega Ratio Z-Score — {_lookback_label}  (±{_VEGA_BAND_N} strikes)  "
+                     "<span style='font-size:11px;color:#6B7280'>"
+                     "Amber=Spot (left) · Purple=Z-Score (right) · "
+                     "&gt;+1σ/+2σ = Call vega dominant · &lt;−1σ/−2σ = Put vega dominant · "
+                     "Grey dash=ATM shift</span>",
+                font=dict(size=13),
+            ),
+            height=290,
+            paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+            margin=dict(l=65, r=65, t=55, b=30),
+            legend=dict(orientation="h", y=1.22, font=dict(size=10)),
+            yaxis=dict(
+                title=dict(text=f"{symbol} Spot", font=dict(color="#F59E0B")),
+                tickfont=dict(color="#F59E0B", size=9),
+                gridcolor="#F3F4F6", autorange=True, showgrid=True,
+            ),
+            yaxis2=dict(
+                title=dict(text=f"Raw Vega Ratio Z-Score ({_lookback_label})", font=dict(color="#7C3AED")),
+                tickfont=dict(color="#7C3AED", size=9),
+                overlaying="y", side="right",
+                zeroline=False, autorange=True, showgrid=False,
+            ),
+            xaxis=dict(tickfont=dict(size=9), title="Time (UTC)",
+                       showgrid=True, gridcolor="#F3F4F6"),
+            hovermode="x unified",
+            font=dict(color="#1A1A2E", size=11),
+        )
+        st.plotly_chart(_vr_fig, use_container_width=True, key="raw_vega_z")
+
+    # ── Chart B: OI-Weighted Vega Ratio Z-Score ──────────────────────────────
+    with _vd_col2:
+        _vo_fig = go.Figure()
+        _vo_fig.add_trace(go.Scatter(
+            x=_vd_times, y=_vd_spot,
+            name=f"{symbol} Spot",
+            mode="lines",
+            line=dict(color="#F59E0B", width=2.5),
+            yaxis="y1",
+            hovertemplate="%{x}<br>Spot: <b>$%{y:,.0f}</b><extra>Spot</extra>",
+        ))
+        _vo_fig.add_trace(go.Scatter(
+            x=_vd_times, y=_vd_oiw_z,
+            name=f"OI-Wtd Vega Ratio Z-Score ({_lookback_label}, ±{_VEGA_BAND_N} strikes)",
+            mode="lines+markers",
+            line=dict(color="#0891B2", width=2.0),
+            marker=dict(size=4, color="#0891B2"),
+            yaxis="y2",
+            customdata=_vd_oiw_ratio,
+            hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>OI-Wtd Ratio: %{customdata:.4f}"
+                          "<extra>ΣOI×call_vega / ΣOI×put_vega</extra>",
+        ))
+        _add_sigma_lines(_vo_fig, "#0891B2")
+        _add_atm_change_annotations(_vo_fig, _vd_times, _vd_atm_k)
+        _vo_fig.update_layout(
+            title=dict(
+                text=f"OI-Weighted Vega Ratio Z-Score — {_lookback_label}  (±{_VEGA_BAND_N} strikes)  "
+                     "<span style='font-size:11px;color:#6B7280'>"
+                     "Amber=Spot (left) · Cyan=Z-Score (right) · "
+                     "&gt;+1σ/+2σ = Call exposure dominant · &lt;−1σ/−2σ = Put / hedge demand · "
+                     "Grey dash=ATM shift</span>",
+                font=dict(size=13),
+            ),
+            height=290,
+            paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+            margin=dict(l=65, r=65, t=55, b=30),
+            legend=dict(orientation="h", y=1.22, font=dict(size=10)),
+            yaxis=dict(
+                title=dict(text=f"{symbol} Spot", font=dict(color="#F59E0B")),
+                tickfont=dict(color="#F59E0B", size=9),
+                gridcolor="#F3F4F6", autorange=True, showgrid=True,
+            ),
+            yaxis2=dict(
+                title=dict(text=f"OI-Wtd Vega Ratio Z-Score ({_lookback_label})", font=dict(color="#0891B2")),
+                tickfont=dict(color="#0891B2", size=9),
+                overlaying="y", side="right",
+                zeroline=False, autorange=True, showgrid=False,
+            ),
+            xaxis=dict(tickfont=dict(size=9), title="Time (UTC)",
+                       showgrid=True, gridcolor="#F3F4F6"),
+            hovermode="x unified",
+            font=dict(color="#1A1A2E", size=11),
+        )
+        st.plotly_chart(_vo_fig, use_container_width=True, key="oiw_vega_z")
+
+    # ── Chart C: Raw CE/PE EV Ratio Z-Score ──────────────────────────────────
+    if len(_evz_times) >= 2:
+        _evz_col1, _evz_col2 = st.columns(2)
+        with _evz_col1:
+            _ev_fig = go.Figure()
+            _ev_fig.add_trace(go.Scatter(
+                x=_evz_times, y=_evz_spot,
+                name=f"{symbol} Spot",
+                mode="lines",
+                line=dict(color="#F59E0B", width=2.5),
+                yaxis="y1",
+                hovertemplate="%{x}<br>Spot: <b>$%{y:,.0f}</b><extra>Spot</extra>",
+            ))
+            _ev_fig.add_trace(go.Scatter(
+                x=_evz_times, y=_evz_raw_z,
+                name=f"Raw CE/PE EV Ratio Z-Score ({_lookback_label}, ±{_VEGA_BAND_N} strikes)",
+                mode="lines+markers",
+                line=dict(color="#059669", width=2.0),
+                marker=dict(size=4, color="#059669"),
+                yaxis="y2",
+                customdata=_evz_raw_ratio,
+                hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>Avg CE/PE EV Ratio: %{customdata:.4f}"
+                              f"<extra>strike-wise avg, ±{_VEGA_BAND_N}</extra>",
+            ))
+            _add_sigma_lines(_ev_fig, "#059669")
+            _add_atm_change_annotations(_ev_fig, _evz_times, _evz_atm_k)
+            _ev_fig.update_layout(
+                title=dict(
+                    text=f"Raw CE/PE EV Ratio Z-Score — {_lookback_label}  (±{_VEGA_BAND_N} strikes)  "
+                         "<span style='font-size:11px;color:#6B7280'>"
+                         "Amber=Spot (left) · Green=Z-Score (right) · "
+                         "&gt;+1σ/+2σ = Call premium relatively rich · &lt;−1σ/−2σ = Put premium relatively rich · "
+                         "Grey dash=ATM shift</span>",
+                    font=dict(size=13),
+                ),
+                height=290,
+                paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+                margin=dict(l=65, r=65, t=55, b=30),
+                legend=dict(orientation="h", y=1.22, font=dict(size=10)),
+                yaxis=dict(
+                    title=dict(text=f"{symbol} Spot", font=dict(color="#F59E0B")),
+                    tickfont=dict(color="#F59E0B", size=9),
+                    gridcolor="#F3F4F6", autorange=True, showgrid=True,
+                ),
+                yaxis2=dict(
+                    title=dict(text=f"Raw CE/PE EV Ratio Z-Score ({_lookback_label})", font=dict(color="#059669")),
+                    tickfont=dict(color="#059669", size=9),
+                    overlaying="y", side="right",
+                    zeroline=False, autorange=True, showgrid=False,
+                ),
+                xaxis=dict(tickfont=dict(size=9), title="Time (UTC)",
+                           showgrid=True, gridcolor="#F3F4F6"),
+                hovermode="x unified",
+                font=dict(color="#1A1A2E", size=11),
+            )
+            st.plotly_chart(_ev_fig, use_container_width=True, key="raw_ev_z")
+
+        # ── Chart D: OI-Weighted CE/PE EV Ratio Z-Score ───────────────────────
+        with _evz_col2:
+            _evo_fig = go.Figure()
+            _evo_fig.add_trace(go.Scatter(
+                x=_evz_times, y=_evz_spot,
+                name=f"{symbol} Spot",
+                mode="lines",
+                line=dict(color="#F59E0B", width=2.5),
+                yaxis="y1",
+                hovertemplate="%{x}<br>Spot: <b>$%{y:,.0f}</b><extra>Spot</extra>",
+            ))
+            _evo_fig.add_trace(go.Scatter(
+                x=_evz_times, y=_evz_oiw_z,
+                name=f"OI-Wtd CE/PE EV Ratio Z-Score ({_lookback_label}, ±{_VEGA_BAND_N} strikes)",
+                mode="lines+markers",
+                line=dict(color="#DB2777", width=2.0),
+                marker=dict(size=4, color="#DB2777"),
+                yaxis="y2",
+                customdata=_evz_oiw_ratio,
+                hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>OI-Wtd CE/PE EV Ratio: %{customdata:.4f}"
+                              f"<extra>strike-wise, OI-weighted, ±{_VEGA_BAND_N}</extra>",
+            ))
+            _add_sigma_lines(_evo_fig, "#DB2777")
+            _add_atm_change_annotations(_evo_fig, _evz_times, _evz_atm_k)
+            _evo_fig.update_layout(
+                title=dict(
+                    text=f"OI-Weighted CE/PE EV Ratio Z-Score — {_lookback_label}  (±{_VEGA_BAND_N} strikes)  "
+                         "<span style='font-size:11px;color:#6B7280'>"
+                         "Amber=Spot (left) · Pink=Z-Score (right) · "
+                         "&gt;+1σ/+2σ = Call premium×OI relatively rich · &lt;−1σ/−2σ = Put premium×OI relatively rich · "
+                         "Grey dash=ATM shift</span>",
+                    font=dict(size=13),
+                ),
+                height=290,
+                paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+                margin=dict(l=65, r=65, t=55, b=30),
+                legend=dict(orientation="h", y=1.22, font=dict(size=10)),
+                yaxis=dict(
+                    title=dict(text=f"{symbol} Spot", font=dict(color="#F59E0B")),
+                    tickfont=dict(color="#F59E0B", size=9),
+                    gridcolor="#F3F4F6", autorange=True, showgrid=True,
+                ),
+                yaxis2=dict(
+                    title=dict(text=f"OI-Wtd CE/PE EV Ratio Z-Score ({_lookback_label})", font=dict(color="#DB2777")),
+                    tickfont=dict(color="#DB2777", size=9),
+                    overlaying="y", side="right",
+                    zeroline=False, autorange=True, showgrid=False,
+                ),
+                xaxis=dict(tickfont=dict(size=9), title="Time (UTC)",
+                           showgrid=True, gridcolor="#F3F4F6"),
+                hovermode="x unified",
+                font=dict(color="#1A1A2E", size=11),
+            )
+            st.plotly_chart(_evo_fig, use_container_width=True, key="oiw_ev_z")
+    else:
+        st.info("⏳ CE/PE EV Ratio Z-Score charts — accumulating ticks (needs ≥2 data refreshes to plot). "
+                "EV ratio fields are populated as history builds up.")
+else:
+    st.info("⏳ All 4 Z-Score charts — accumulating ticks (needs ≥2 data refreshes to plot). "
+            "Once the second tick is recorded, the charts will populate here automatically.")
+
+st.caption(f"Owner settings · refresh {REFRESH_SECS_EFFECTIVE}s · vega band ±{_VEGA_BAND_N} strikes · "
+           f"Z-Score TF {_ZS_BUCKET_MIN}m · lookback {_ZS_BUCKET_LOOKBACK} bars · "
+           f"history {len(hist)} ticks · ⚠ Educational analytics — not financial advice.")
