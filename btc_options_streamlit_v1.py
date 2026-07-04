@@ -2888,9 +2888,9 @@ dvol_now, dvol_hist = cached_dvol(symbol)
 vix_signal       = fetch_vix_signal(dvol_now, dvol_hist)
 # Term structure: compare front expiry vs next one if available
 back_expiry_str  = None
-if len(exp_list) >= 2:
+if len(_exp_list_raw) >= 2:
     try:
-        back_expiry_str = str(exp_list[1] if (not expiry_arg or str(exp_list[0]) == expiry_arg) else exp_list[0])
+        back_expiry_str = str(_exp_list_raw[1] if (not expiry_arg or str(_exp_list_raw[0]) == expiry_arg) else _exp_list_raw[0])
     except Exception:
         back_expiry_str = None
 ts_signal        = cached_term_structure(symbol, expiry_arg, back_expiry_str) if back_expiry_str else {"available": False}
@@ -2901,7 +2901,7 @@ enhanced_bias    = compute_enhanced_price_bias(vwap_or, ts_signal, vix_signal,
 combined_decision= generate_combined_decision(m, spot, bias, smile_state, hist,
                                               vwap_or, ts_signal, vix_signal, enhanced_bias)
 grf              = _compute_grf(m, spot)
-leading_signals  = compute_leading_signals(m, bias, spot, hist, smile_state, exp_list)
+leading_signals  = compute_leading_signals(m, bias, spot, hist, smile_state, _exp_list_raw)
 shantanu_view    = compute_shantanu_view(df_band, m, spot, symbol)
 cross_venue      = cached_cross_venue(symbol)
 
