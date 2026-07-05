@@ -2867,10 +2867,11 @@ if not m:
 # Tag the symbol onto m so smile classifier can pick up the right strike step
 m["_symbol"] = symbol
 
-df_band   = m.pop("df_band")
-df_signal = m.pop("df_signal")
-
 # History (persisted across reruns + sessions; appended once per new tick)
+# NOTE: build_history_entry() reads m["df_signal"]/m["df_band"] to compute the
+# ATM-band vega + EV-ratio fields that feed Section 18's Z-Score charts. It
+# must run BEFORE these keys are popped off m below — otherwise it always
+# sees None and every Z-Score chart is stuck at zero/constant forever.
 all_hist = _load_history()
 hist     = all_hist.get(symbol, [])
 if not hist or hist[-1].get("ts") != tick_ts:
@@ -2878,6 +2879,9 @@ if not hist or hist[-1].get("ts") != tick_ts:
     hist = hist[-MAX_HISTORY:]
     all_hist[symbol] = hist
     _save_history(all_hist)
+
+df_band   = m.pop("df_band")
+df_signal = m.pop("df_signal")
 
 bias  = compute_bias(m, hist[:-1])
 strat = strategy_recommendation(bias, m, symbol)
